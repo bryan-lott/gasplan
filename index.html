@@ -1,0 +1,2029 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gas Stop Planner</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root { color-scheme: light dark; --bg:#fff; --fg:#111; --mut:#666; --line:#ddd; --accent:#c2410c; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#15171a; --fg:#e8e8e8; --mut:#999; --line:#333; --accent:#fb923c; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.45 system-ui, sans-serif; background:var(--bg); color:var(--fg);
+         display:grid; grid-template-columns: 380px 1fr; height:100vh; }
+  @media (max-width: 800px) { body { grid-template-columns:1fr; grid-template-rows:auto 50vh; height:auto; } }
+  #panel { padding:16px; overflow-y:auto; border-right:1px solid var(--line); }
+  #map { height:100%; min-height:300px; }
+  h1 { font-size:18px; margin:0 0 12px; }
+  label { display:block; font-size:12px; color:var(--mut); margin:10px 0 3px; }
+  input, select { width:100%; padding:7px 9px; font:inherit; background:var(--bg); color:var(--fg);
+          border:1px solid var(--line); border-radius:5px; }
+  .row { display:flex; gap:8px; }
+  .row > * { flex:1; min-width:0; }
+  button { margin-top:14px; width:100%; padding:9px; font:inherit; font-weight:600; cursor:pointer;
+           background:var(--accent); color:#fff; border:0; border-radius:5px; }
+  button:disabled, select:disabled { opacity:.5; cursor:default; }
+  #status { margin-top:12px; font-size:13px; color:var(--mut); }
+  #status.err { color:#dc2626; }
+  ol { padding-left:0; list-style:none; margin:14px 0 0; }
+  li { border-top:1px solid var(--line); padding:9px 0; }
+  .name { font-weight:600; }
+  .meta { font-size:12px; color:var(--mut); }
+  .n { display:inline-block; width:20px; height:20px; line-height:20px; text-align:center; font-size:11px;
+       border-radius:50%; background:var(--accent); color:#fff; margin-right:6px; }
+  a { color:var(--accent); }
+  .warn { background:#fef3c7; color:#78350f; padding:8px; border-radius:5px; font-size:13px; margin-top:10px; }
+  .wp-row { display:flex; gap:6px; margin-top:6px; }
+  .wp-row input { flex:1; }
+  .wp-row button { flex:none; width:30px; margin:0; padding:0; font-weight:400; }
+  #addWp { background:transparent; color:var(--accent); border:1px dashed var(--line); font-weight:400; }
+  .opt { border:1px solid var(--line); border-radius:5px; padding:8px 10px; margin-top:8px; cursor:pointer; }
+  .opt:hover { border-color:var(--accent); }
+  .opt.sel { border-color:var(--accent); background:rgba(194,65,12,.08); }
+</style>
+</head>
+<body>
+<div id="panel">
+  <h1>⛽ Gas Stop Planner</h1>
+  <label>Waypoints, in order</label>
+  <div id="waypoints"></div>
+  <button id="addWp" type="button">+ add destination</button>
+  <label>Vehicle (optional lookup)</label>
+  <div class="row">
+    <select id="vy" disabled><option value="">Year…</option></select>
+    <select id="vmk" disabled><option value="">Make…</option></select>
+  </div>
+  <div class="row" style="margin-top:6px">
+    <select id="vmd" disabled><option value="">Model…</option></select>
+    <select id="vtr" disabled><option value="">Trim…</option></select>
+  </div>
+  <div class="row">
+    <div><label for="mpg">Highway mpg</label><input id="mpg" type="number" value="24"></div>
+    <div><label for="gal">Tank (gal)</label><input id="gal" type="number" value="15"></div>
+  </div>
+  <div id="tankNote" class="meta"></div>
+  <div id="rangeInfo" class="meta"></div>
+  <div class="row">
+    <div><label for="fuel">Start fuel %</label><input id="fuel" type="number" value="100"></div>
+    <div><label for="reserve">Reserve %</label><input id="reserve" type="number" value="15"></div>
+  </div>
+  <label for="price">Fuel price ($/gal, for the cost estimate — not fetched, edit to match reality)</label>
+  <input id="price" type="number" value="3.50" step="0.01" min="0">
+  <label for="over">MPH over the posted limit</label>
+  <input id="over" type="number" value="5">
+  <label for="windBasis">Wind for planning</label>
+  <div class="row">
+    <select id="windBasis"><option value="live">Live forecast</option><option value="typical">Typical for a date</option></select>
+    <input id="windDate" type="date" style="display:none">
+  </div>
+  <div id="windNote" class="meta"></div>
+  <button id="go">Plan route</button>
+  <div id="routeOptions"></div>
+  <button id="cmpBtn" type="button" style="display:none">Compare corridors</button>
+  <div id="compare" class="meta"></div>
+  <div id="status"></div>
+  <div id="econ" class="meta"></div>
+  <ol id="wpInfo"></ol>
+  <ol id="stops"></ol>
+  <div class="row" id="exportRow" style="margin-top:14px">
+    <button id="expGmaps" type="button">Google Maps link</button>
+    <button id="expKml" type="button">Download KML</button>
+  </div>
+  <div id="exportOut" class="meta"></div>
+</div>
+<div id="map"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const KM_PER_MI = 1.609344;
+const DETOUR_WEIGHT = 8;     // 1 km of detour must buy 8 km of progress to be worth it
+const SEARCH_RADIUS_M = 3000;
+const SEARCH_STEP_KM = 5;    // < 2 x radius, so the search circles leave no gap along the route
+// maps.mail.ru first: verified in a real browser from a file:// page, 2026-08-05 (3 runs) —
+// 200 in 6-8s twice, one 504 in 35.5s (a real server response, not a CORS block or client abort),
+// all with the null origin accepted. overpass-api.de sends no Access-Control-Allow-Origin for a
+// null origin (2/2 clean runs: instant "Failed to fetch" + CORS error in the console, 500-800ms);
+// kept second only as a fallback for when this app is served over http:// instead of opened from
+// disk, where its origin isn't null and it works fine. overpass.kumi.systems is DROPPED: 3/3 fresh
+// runs hung the full 45s with zero bytes back, no CORS error, nothing — dead, not intermittent,
+// contradicting an earlier one-off browser measurement that saw it answer in 62-65s. curl-based
+// verification could never have caught the CORS half of this: curl doesn't enforce CORS.
+const OVERPASS_ENDPOINTS = ['https://maps.mail.ru/osm/tools/overpass/api/interpreter',
+                            'https://overpass-api.de/api/interpreter'];
+
+// --- route corridor discovery -----------------------------------------------
+// ponytail: no keyless API gives "N maximally distinct corridors", so this fires extra via-routes
+// through points offset perpendicular to the origin-destination line and de-dupes the survivors.
+// Verified failure mode: an offset can land in water/mountains/nowhere-routable — handled by
+// discarding routes that fail to fetch or come back absurdly long, not by smarter placement.
+const OFFSET_KM = 200;         // perpendicular offset distance, middle of the verified 150-250km range
+const OFFSET_FRACS = [1 / 3, 2 / 3]; // how far along the origin-destination line to plant the offset
+const ABSURD_MULT = 1.5;       // candidates over 1.5x the shortest survivor's distance are discarded
+const DEDUPE_KM = 150;         // corridors within this + a shared dominant ref count as duplicates
+
+// --- fuel-economy adjustment coefficients -----------------------------------
+// Named and grouped here so they're tunable without hunting through the logic below.
+const ELEV_SAMPLES = 150;        // ~100-200 evenly spaced points along the route, per the brief
+const ELEV_BATCH = 100;          // Open-Meteo elevation hard cap, verified: 100 ok, 150 -> 400
+const CLIMB_COEF = 0.08;         // ponytail: physically-reasoned, not a measured coefficient
+const CLIMB_FLOOR = 0.4;         // never let a climb factor collapse to zero/negative
+const DESCENT_COEF = 0.02;       // ponytail: much smaller than CLIMB_COEF on purpose — a non-hybrid
+                                  // gas vehicle recovers almost nothing coasting downhill
+const AERO_SHARE = 0.5;          // ponytail: physically-derived assumption that ~half of highway fuel
+                                  // burn is aero drag, not a published figure
+const SPEED_BASE_MPH = 60;       // fueleconomy.gov "Driving More Efficiently" — economy falls off above ~60mph
+const SPEED_COEF = 0.07;         // midpoint of DOE/fueleconomy.gov's published 5-10%-per-5mph-over range
+const SPEED_FACTOR_FLOOR = 0.4;  // sanity floor, matches CLIMB_FLOOR
+const OVER_LIMIT_DEFAULT = 5;    // mph over the posted limit — the feature the user actually asked for
+const MOTORWAY_MPH_THRESHOLD = 45; // ponytail: heuristic split between "local road" and "motorway-like"
+                                    // OSRM step, used only to decide where the speed calibration below applies
+const MOTORWAY_SPEED_BUMP = 1.15;  // ponytail: verified OSRM's public demo profile reports ~56-62mph on
+                                    // real interstates posted 70-80; this is a rough upward calibration for
+                                    // motorway-class segments, not measured per-route. Not shown to the user
+                                    // as "the speed limit" — see speedFactor's caller.
+const FACTOR_SCALE_LO = 0.6;   // per-segment colour scale: combined factor at/below this -> full "worse" colour
+const FACTOR_SCALE_HI = 1.15;  // combined factor at/above this -> full "better" colour
+const SEGMENT_PANEL_ROWS = 24; // per-segment panel list: bucket raw samples down to about this many rows
+
+// --- typical (historical) wind ----------------------------------------------
+// ponytail: multi-year averaging costs one archive-api request per (year x day-bucket), covering
+// every point at once — but a full ELEV_SAMPLES=150 resolution would still multiply that cost 7.5x
+// for a wind term that's already a broad, physically-reasoned nudge, not a precise measurement.
+// Fetched at WIND_HIST_SAMPLES points and interpolated (as u/v, see windToVec) back onto the full
+// route resolution. Upgrade ceiling: raise this if a route ever shows visibly blocky wind bands.
+const WIND_HIST_SAMPLES = 20;
+// years of history vector-averaged into one "typical" value. Was 5; measured against live
+// archive-api data for a Lakewood CO -> Black Rock City NV corridor point (2026-08-05): 3-year
+// vs 5-year vector-mean differed by 0.34 mph / 0.5 deg (noise), while 1-year vs 5-year differed
+// by 1.9 mph / 18.5 deg (a single year is not a climatology). 3 years is not a materially
+// different answer from 5 and cuts archive-api requests by 40% (the heaviest single consumer —
+// see the request-count report). Upgrade ceiling: bump back toward 5 if a route ever shows a
+// visibly noisy/unstable comparison result.
+const WIND_HIST_YEARS = 3;
+const WIND_HIST_DAY_WINDOW = 3;  // +/- days around the target date per year, smooths day noise
+                                  // without drifting into a different season
+
+// Full-tank range in miles. Pure so the physics agent can adjust mpg per-leg
+// and re-derive range without touching the DOM.
+function vehicleRange(mpg, gallons) { return mpg * gallons; }
+
+// ponytail: EPA's vehicle-detail record has no tank-capacity field (range/rangeCity/rangeHwy
+// verified 0 for every gasoline vehicle via curl, 2026-08-05) and NHTSA vPIC has no fuel data
+// either — no keyless source has the real number. VClass (the size class EPA does report, e.g.
+// "Compact Cars", "Small Sport Utility Vehicle 2WD") maps to a typical class-average tank
+// instead. Ceiling: this is a class average, not the actual vehicle's tank — always shown to the
+// user as an estimate, never auto-filled over a value they typed themselves.
+const VCLASS_TANK_GAL = [
+  [/small pickup/i, 21], [/pickup/i, 26],
+  [/small sport utility/i, 16], [/(standard|large) sport utility/i, 24], [/sport utility/i, 20],
+  [/van/i, 20],
+  [/wagon/i, 16],
+  [/two seater/i, 15],
+  [/large/i, 18],
+  [/midsize/i, 16],
+  [/(subcompact|minicompact|compact)/i, 13],
+];
+const DEFAULT_TANK_GAL = 15; // fallback for a VClass string that matches none of the above
+function tankFromVClass(vclass) {
+  const hit = VCLASS_TANK_GAL.find(([re]) => re.test(vclass || ''));
+  return hit ? hit[1] : DEFAULT_TANK_GAL;
+}
+
+// --- fuel economy: per-segment factors --------------------------------------
+// Every factor below is an mpg *multiplier* for a segment: >1 = better economy than base,
+// <1 = worse. Combined multiplicatively, they turn a real km into a "fuel km" via
+// costKm = realKm / factor (equivalently realKm * baseMpg/adjustedMpg) — see buildFuelAxis.
+
+// Grade in %. Climbing costs more than descending saves back (asymmetric on purpose — see
+// DESCENT_COEF above). Grade is averaged over multi-km sample spans, so it understates short
+// steep pitches; that's an honest limitation of sampling every ~1-2 km, not a modeling choice.
+function gradeFactor(gradePct) {
+  return gradePct >= 0 ? Math.max(CLIMB_FLOOR, 1 - CLIMB_COEF * gradePct)
+                       : 1 + DESCENT_COEF * Math.abs(gradePct);
+}
+
+// Initial bearing a->b in degrees, 0-360.
+function bearing(a, b) {
+  const rad = Math.PI / 180;
+  const y = Math.sin((b[1] - a[1]) * rad) * Math.cos(b[0] * rad);
+  const x = Math.cos(a[0] * rad) * Math.sin(b[0] * rad) -
+            Math.sin(a[0] * rad) * Math.cos(b[0] * rad) * Math.cos((b[1] - a[1]) * rad);
+  return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+}
+
+// mph of headwind (positive) or tailwind (negative flips the sign). windDirFrom is the
+// direction the wind blows FROM (Open-Meteo convention), travelBearing the direction of travel.
+function headwindMph(windSpeedMph, windDirFrom, travelBearing) {
+  return windSpeedMph * Math.cos((windDirFrom - travelBearing) * Math.PI / 180);
+}
+
+// Aero drag scales with airspeed^3, but only the aero share of total fuel burn feels it.
+function windFactor(headwind, vGroundMph) {
+  const vAir = vGroundMph + headwind;
+  if (vAir <= 0) return 1; // headwind stronger than ground speed is pathological input, not physics — bail out
+  return 1 / (1 + AERO_SHARE * ((vAir / vGroundMph) ** 3 - 1));
+}
+
+// Wind as a u/v vector (Open-Meteo's "from" convention: dirFrom is where the wind blows FROM).
+// u/v point where the air is actually heading, so plain componentwise averaging is valid — unlike
+// averaging the raw FROM-degree numbers, which breaks at the wraparound (mean of 350° and 10° is
+// ~0°, not 180°). Also used to interpolate wind along the route without that same wraparound bug.
+function windToVec(speed, dirFrom) {
+  const rad = dirFrom * Math.PI / 180;
+  return { u: -speed * Math.sin(rad), v: -speed * Math.cos(rad) };
+}
+// Inverse of windToVec: recovers the resultant speed/direction from averaged u/v components. This
+// is the *vector-mean* wind (net prevailing drift) — its magnitude is <= the mean scalar speed
+// whenever directions vary, because opposing samples partially cancel instead of just adding. For
+// a headwind/tailwind fuel model that's the physically defensible number (see windFactor), but it
+// is not the same thing as "the average wind speed" a driver would report by eye.
+function vecToWind(u, v) {
+  const speed = Math.hypot(u, v);
+  if (speed < 1e-6) return { speed: 0, dir: 0 }; // near-total cancellation — direction is undefined,
+                                                   // harmless (headwindMph(~0, ...) ~ 0 regardless)
+  return { speed, dir: (Math.atan2(-u, -v) * 180 / Math.PI + 360) % 360 };
+}
+// Vector-mean of several {speed, dir} observations — the correct way to average wind direction.
+function windVecMean(obs) {
+  const sum = obs.reduce((a, o) => {
+    const c = windToVec(o.speed, o.dir);
+    return { u: a.u + c.u, v: a.v + c.v };
+  }, { u: 0, v: 0 });
+  return vecToWind(sum.u / obs.length, sum.v / obs.length);
+}
+
+// Source: fueleconomy.gov "Driving More Efficiently" — mpg drops roughly 5-10% per 5mph over ~60.
+function speedFactor(mph) {
+  return Math.max(SPEED_FACTOR_FLOOR, 1 - SPEED_COEF * Math.max(0, (mph - SPEED_BASE_MPH) / 5));
+}
+
+// Piecewise-linear lookup between two parallel cumulative-km arrays built from the same sample
+// points (e.g. real km vs fuel-adjusted km). Pass (from, to, x) to map an x on `from`'s axis to
+// the corresponding position on `to`'s axis; swap the arrays to go the other direction.
+function interpAxis(from, to, x) {
+  const last = from.length - 1;
+  if (x <= from[0]) return to[0];
+  if (x >= from[last]) return to[last];
+  let i = 0;
+  while (from[i + 1] < x) i++;
+  const f = (x - from[i]) / (from[i + 1] - from[i]);
+  return to[i] + f * (to[i + 1] - to[i]);
+}
+
+// Local d(to)/d(from) rate at x — the slope of the same segment interpAxis would interpolate
+// on. Used to carry a real-km distance (e.g. a detour) onto the `to` axis at the right local
+// cost, instead of the single interpAxis(x) point value. Zero-length segment -> rate 1 (no data
+// to scale by); identity axis (to === from) -> rate exactly 1, so unadjusted behaviour is untouched.
+function axisRate(from, to, x) {
+  const last = from.length - 1;
+  let i = x >= from[last] ? last - 1 : 0;
+  while (i < last - 1 && from[i + 1] < x) i++;
+  const span = from[i + 1] - from[i];
+  return span > 0 ? (to[i + 1] - to[i]) / span : 1;
+}
+
+// OSRM's per-step distance/duration, as a lookup by cumulative km along the route. Free from the
+// route response already fetched (steps=true) — no extra request.
+function stepSpeeds(route) {
+  const steps = (route.legs || []).flatMap(l => l.steps || []);
+  let km = 0;
+  return steps.map(s => {
+    const distKm = s.distance / 1000;
+    const seg = { toKm: km + distKm, mph: s.duration > 0 ? (distKm / KM_PER_MI) / (s.duration / 3600) : 0 };
+    km += distKm;
+    return seg;
+  });
+}
+function mphAt(steps, km) {
+  if (!steps.length) return null;
+  const s = steps.find(s => km <= s.toKm) || steps[steps.length - 1];
+  return s.mph || null;
+}
+
+// Builds a fuel-adjusted distance axis parallel to `sampleKm`: adjCum[i] is the "fuel km" cost
+// of the real distance sampleKm[0..i]. When every factor is 1 (no data, or a flat, calm, at-limit
+// route) adjCum === sampleKm and downstream planning is identical to the unadjusted case.
+function buildFuelAxis(sampleKm, samplePts, elevations, winds, steps, overLimitMph) {
+  const adjCum = [0];
+  const segments = []; // one entry per sample interval — the "where on the route" breakdown
+  let terrainCost = 0, windCost = 0, speedCost = 0, weighted = 0;
+  for (let i = 1; i < sampleKm.length; i++) {
+    const realKm = sampleKm[i] - sampleKm[i - 1];
+    const rawMph = mphAt(steps, (sampleKm[i - 1] + sampleKm[i]) / 2);
+    // ponytail: 65mph fallback only fires if OSRM returned no usable step data for this stretch.
+    const calibMph = rawMph ? (rawMph > MOTORWAY_MPH_THRESHOLD ? rawMph * MOTORWAY_SPEED_BUMP : rawMph) : 65;
+    const actualMph = calibMph + overLimitMph;
+    const speed = speedFactor(actualMph);
+
+    let terrain = 1;
+    if (elevations && realKm > 0) {
+      const gradePct = (elevations[i] - elevations[i - 1]) / (realKm * 1000) * 100;
+      terrain = gradeFactor(gradePct);
+    }
+    let wind = 1;
+    if (winds) {
+      const brg = bearing(samplePts[i - 1], samplePts[i]);
+      wind = windFactor(headwindMph(winds[i].speed, winds[i].dir, brg), actualMph);
+    }
+
+    const factor = terrain * wind * speed;
+    adjCum.push(adjCum[i - 1] + realKm / factor);
+    segments.push({ fromKm: sampleKm[i - 1], toKm: sampleKm[i], realKm,
+      fromPt: samplePts[i - 1], toPt: samplePts[i], terrain, wind, speed, factor });
+    if (realKm > 0) {
+      terrainCost += realKm / terrain; windCost += realKm / wind; speedCost += realKm / speed;
+      weighted += realKm;
+    }
+  }
+  const adjTotal = adjCum[adjCum.length - 1];
+  return {
+    adjCum, segments,
+    overallFactor: weighted ? weighted / adjTotal : 1,
+    terrainPct: weighted ? (terrainCost / weighted - 1) * 100 : 0,
+    windPct: weighted ? (windCost / weighted - 1) * 100 : 0,
+    speedPct: weighted ? (speedCost / weighted - 1) * 100 : 0,
+  };
+}
+
+// --- per-segment display: colour scale + panel bucketing (pure) -------------
+
+// Diverging, colourblind-safe (Okabe-Ito blue/orange — never red/green): orange = burns more
+// fuel than baseline, pale grey = neutral (factor 1), blue = burns less. Clamped so a segment
+// outside the expected range still gets a defined colour instead of extrapolating into garbage.
+function factorColor(factor) {
+  const t = Math.max(0, Math.min(1, (factor - FACTOR_SCALE_LO) / (FACTOR_SCALE_HI - FACTOR_SCALE_LO)));
+  const [c0, c1, u] = t < 0.5 ? [[230, 159, 0], [230, 230, 230], t / 0.5]
+                               : [[230, 230, 230], [0, 114, 178], (t - 0.5) / 0.5];
+  return `rgb(${c0.map((v, i) => Math.round(v + (c1[i] - v) * u)).join(',')})`;
+}
+
+// Buckets raw per-sample segments into ~targetRows contiguous stretches for a compact panel
+// list — same weighted-cost math buildFuelAxis uses for the trip-level summary, just per bucket.
+function aggregateSegments(segments, targetRows) {
+  if (!segments.length) return [];
+  const bucketSize = Math.max(1, Math.ceil(segments.length / targetRows));
+  const rows = [];
+  for (let i = 0; i < segments.length; i += bucketSize) {
+    const group = segments.slice(i, i + bucketSize);
+    const realKm = group.reduce((a, s) => a + s.realKm, 0);
+    if (realKm <= 0) continue;
+    const adjKm = group.reduce((a, s) => a + s.realKm / s.factor, 0);
+    rows.push({
+      fromKm: group[0].fromKm, toKm: group[group.length - 1].toKm, realKm,
+      terrainPct: (group.reduce((a, s) => a + s.realKm / s.terrain, 0) / realKm - 1) * 100,
+      windPct: (group.reduce((a, s) => a + s.realKm / s.wind, 0) / realKm - 1) * 100,
+      speedPct: (group.reduce((a, s) => a + s.realKm / s.speed, 0) / realKm - 1) * 100,
+      factor: realKm / adjKm,
+    });
+  }
+  return rows;
+}
+
+// --- geo helpers -----------------------------------------------------------
+
+function haversine(a, b) { // [lat, lon] pairs -> km
+  const rad = Math.PI / 180;
+  const dLat = (b[0] - a[0]) * rad, dLon = (b[1] - a[1]) * rad;
+  const s = Math.sin(dLat / 2) ** 2 +
+            Math.cos(a[0] * rad) * Math.cos(b[0] * rad) * Math.sin(dLon / 2) ** 2;
+  return 6371 * 2 * Math.asin(Math.sqrt(s));
+}
+
+// Cumulative along-route distance for each vertex.
+function cumulate(pts) {
+  const cum = [0];
+  for (let i = 1; i < pts.length; i++) cum.push(cum[i - 1] + haversine(pts[i - 1], pts[i]));
+  return cum;
+}
+
+// Route vertex nearest to `km` along the route.
+function pointAt(pts, cum, km) {
+  if (km <= 0) return pts[0];
+  if (km >= cum[cum.length - 1]) return pts[pts.length - 1];
+  let lo = 0, hi = cum.length - 1;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (cum[mid] < km) lo = mid + 1; else hi = mid; }
+  return pts[lo];
+}
+
+// Nearest route vertex to a station: {km along route, detour km one-way}.
+// ponytail: vertex-only scan, not true point-to-segment projection. Route vertices are
+// dense enough (~tens of metres on OSRM full geometry) that the error is under the
+// Overpass search radius. Switch to segment projection if routes get simplified.
+function project(station, pts, cum) {
+  let best = Infinity, bestI = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const d = haversine(station, pts[i]);
+    if (d < best) { best = d; bestI = i; }
+  }
+  return { km: cum[bestI], detour: best };
+}
+
+// Point `km` from `pt` along compass bearing `bearingDeg` (standard great-circle destination formula).
+function destPoint(pt, bearingDeg, km) {
+  const R = 6371, rad = Math.PI / 180;
+  const lat1 = pt[0] * rad, lon1 = pt[1] * rad, brg = bearingDeg * rad, d = km / R;
+  const lat2 = Math.asin(Math.sin(lat1) * Math.cos(d) + Math.cos(lat1) * Math.sin(d) * Math.cos(brg));
+  const lon2 = lon1 + Math.atan2(Math.sin(brg) * Math.sin(d) * Math.cos(lat1),
+                                  Math.cos(d) - Math.sin(lat1) * Math.sin(lat2));
+  return [lat2 / rad, ((lon2 / rad) + 540) % 360 - 180];
+}
+
+// A point `km` off to one `side` (+1/-1) of the a->b line, `frac` of the way along it.
+// ponytail: linear lat/lon interpolation for the "along the line" point, not a true great-circle
+// fraction — fine at the few-hundred-km offsets this feeds into, upgrade to slerp if trips go global.
+function perpOffsetPoint(a, b, frac, km, side) {
+  const base = [a[0] + (b[0] - a[0]) * frac, a[1] + (b[1] - a[1]) * frac];
+  return destPoint(base, bearing(a, b) + 90 * side, km);
+}
+
+// --- route corridors: labeling & de-dup (pure) ------------------------------
+
+function routeSteps(route) { return (route.legs || []).flatMap(l => l.steps || []); }
+
+// Full route point list built from each step's own geometry, [lat,lon] pairs — free even when
+// the request used overview=false (discovery candidates, see discoverCandidates), because OSRM
+// includes per-step geometry regardless of the overview setting (verified via curl, 2026-08-05:
+// an overview=false request still returned full-resolution step geometry, ~6900 coordinate pairs
+// for a ~1500km route). Used to compare corridor economy without a second OSRM request.
+function pointsFromSteps(route) {
+  const pts = routeSteps(route).flatMap(s => (s.geometry?.coordinates || []).map(c => [c[1], c[0]]));
+  return pts.length ? pts : null;
+}
+
+// OSRM refs look like "I 70", "US 6; US 191" (take the first), "49" (bare number/county road).
+function normalizeRef(ref) { return ref.split(';')[0].trim().replace(/ /g, '-'); }
+function isMajorRef(ref) { return /^(I|US)-/.test(ref); }
+
+// Distance-weighted road refs for a route, majors preferred over bare numbers when both appear.
+function topRefs(steps, n) {
+  const totals = new Map();
+  for (const s of steps) {
+    if (!s.ref) continue;
+    const r = normalizeRef(s.ref);
+    totals.set(r, (totals.get(r) || 0) + s.distance);
+  }
+  let entries = [...totals.entries()];
+  if (entries.some(([r]) => isMajorRef(r))) entries = entries.filter(([r]) => isMajorRef(r));
+  return entries.sort((a, b) => b[1] - a[1]).slice(0, n);
+}
+function labelRoute(steps) {
+  const refs = topRefs(steps, 2).map(([r]) => r);
+  return refs.length ? 'via ' + refs.join(' / ') : 'via unnamed roads';
+}
+
+// Distance-weighted refs beyond labelRoute's top-2 — casts a wider net so a road where two
+// corridors actually diverge (often buried below the shared trunk by distance — I-80 dominates
+// every northern option between Lakewood CO and Black Rock City NV) is available to break a
+// label collision.
+function candidateRefs(route) { return topRefs(routeSteps(route), 8).map(([r]) => r); }
+
+// Corridors sharing a dominant trunk get identical labelRoute() labels even when they're
+// genuinely different paths (verified: Lakewood CO -> Black Rock City NV produces two "via I-80 /
+// I-25" options 969mi/1010mi that diverge on US-191). Re-label any pair that collides using a ref
+// where they differ; fall back to appending distance if no ref distinguishes them at all — the
+// panel must never show two options a user can't tell apart.
+function labelCandidates(kept) {
+  const labels = kept.map(c => labelRoute(routeSteps(c.route)));
+  const refs = kept.map(c => candidateRefs(c.route));
+  return kept.map((c, i) => {
+    const clashes = kept.map((_, j) => j).filter(j => j !== i && labels[j] === labels[i]);
+    if (!clashes.length) return labels[i];
+    const otherRefs = new Set(clashes.flatMap(j => refs[j]));
+    const divergent = refs[i].find(r => !otherRefs.has(r));
+    if (!divergent) return `${labels[i]} (${Math.round(c.route.distance / 1000)} km)`;
+    const shared = refs[i].find(r => otherRefs.has(r));
+    return 'via ' + (shared ? [shared, divergent] : [divergent]).join(' / ');
+  });
+}
+
+// Maneuver location of the step nearest the route's halfway point, [lat,lon].
+function corridorMidpoint(steps) {
+  const total = steps.reduce((a, s) => a + (s.distance || 0), 0);
+  let acc = 0;
+  for (const s of steps) {
+    acc += s.distance || 0;
+    if (acc >= total / 2) return s.maneuver ? [s.maneuver.location[1], s.maneuver.location[0]] : null;
+  }
+  return null;
+}
+function corridorSignature(route) {
+  const steps = routeSteps(route);
+  return { refs: topRefs(steps, 2).map(([r]) => r), mid: corridorMidpoint(steps) };
+}
+// Same corridor if they share a dominant ref AND pass through the same part of the map —
+// shared refs alone false-positive on routes that briefly overlap near shared endpoints.
+function isDuplicateCorridor(a, b) {
+  const sharedRef = a.refs.some(r => b.refs.includes(r));
+  const closeMid = !!(a.mid && b.mid && haversine(a.mid, b.mid) < DEDUPE_KM);
+  return sharedRef && closeMid;
+}
+
+// Cumulative real distance/duration at each waypoint, from route.legs[] (legs[i] spans
+// waypoint i -> i+1). bounds[0] is the start (0, 0); bounds[i] is the total through waypoint i.
+// Seam for the next agents: per-leg time and remaining-tank-at-each-destination read off this,
+// no need to reconstruct legs from geometry.
+function legBoundaries(route) {
+  const bounds = [{ distKm: 0, durationS: 0 }];
+  let distKm = 0, durationS = 0;
+  for (const leg of route.legs || []) {
+    distKm += leg.distance / 1000;
+    durationS += leg.duration;
+    bounds.push({ distKm, durationS });
+  }
+  return bounds;
+}
+
+// Hours/minutes, not decimal hours — the user's stated purpose is planning bathroom/food breaks,
+// and "18.9h" doesn't tell you when to look for an exit.
+function fmtDuration(seconds) {
+  const totalMin = Math.round(seconds / 60);
+  const d = Math.floor(totalMin / 1440), h = Math.floor((totalMin % 1440) / 60), m = totalMin % 60;
+  return d > 0 ? `${d}d ${h}h ${m}m` : h > 0 ? `${h}h ${m}m` : `${m}m`;
+}
+
+// Cumulative real km <-> seconds at each OSRM step boundary — the finest-grained distance/time
+// mapping the already-fetched route gives for free (steps=true costs nothing extra, see
+// fetchRoute). Feeds per-stop and per-waypoint driving time via interpAxis — no new request.
+function stepCumulative(route) {
+  const steps = routeSteps(route);
+  const km = [0], s = [0];
+  let d = 0, t = 0;
+  for (const step of steps) { d += step.distance / 1000; t += step.duration; km.push(d); s.push(t); }
+  return { km, s };
+}
+
+// Fuel remaining at each user waypoint AND at each planned stop (arrival, before refilling),
+// worked out on the fuel-adjusted axis (toAdj maps a real route-km to it) so terrain/wind/speed
+// cost is honoured, not raw distance. ponytail refill assumption: the tank fills to full at every
+// planned stop — the same assumption planStops already reasons about range with. A driver who
+// skips a planned stop will have less than this by the next waypoint; treat it as an upper bound,
+// not a guarantee.
+function fuelAtWaypoints(legBounds, stops, toAdj, kmPerGal, tankGal, startFuel) {
+  const events = legBounds.slice(1).map((b, i) => ({ adj: toAdj(b.distKm), waypoint: i }))
+    .concat(stops.map((s, i) => ({ adj: s.km, stop: i, refill: true })))
+    .sort((a, b) => a.adj - b.adj);
+  let gal = tankGal * startFuel, lastAdj = 0;
+  const waypoints = [], stopArrivals = [];
+  for (const e of events) {
+    gal -= (e.adj - lastAdj) / kmPerGal;
+    lastAdj = e.adj;
+    const arrival = { gal: Math.max(0, gal), pct: Math.max(0, gal / tankGal * 100) };
+    if (e.waypoint !== undefined) waypoints[e.waypoint] = arrival;
+    if (e.stop !== undefined) stopArrivals[e.stop] = arrival; // fuel on arrival, before the refill below
+    if (e.refill) gal = tankGal;
+  }
+  return { waypoints, stops: stopArrivals };
+}
+
+// --- remote data -----------------------------------------------------------
+
+// In-memory response caches (session lifetime, cleared on reload). Elevation for a coordinate
+// and a historical-wind daily record for a coordinate+date-range never change, so a replanned
+// route — same corridor, same trip date — should cost zero new requests for either. This is the
+// single biggest lever on Open-Meteo volume: see the request-count report for before/after.
+const elevCache = new Map(); // coordKey(pt) -> elevation metres
+const histCache = new Map(); // `${coordKey(pt)}|${startISO}|${endISO}` -> {daily}
+
+// Rounds to the same 4-decimal precision (~11m) already sent to Open-Meteo, so two sample
+// points computed independently (e.g. compareCandidates' step geometry vs planCandidate's full
+// route geometry) that land on the same real-world spot share a cache entry.
+function coordKey(pt) { return `${pt[0].toFixed(4)},${pt[1].toFixed(4)}`; }
+
+async function getJSON(url, opts = {}) {
+  const host = new URL(url).hostname;
+  let res;
+  try {
+    res = await fetch(url, { signal: AbortSignal.timeout(opts.timeout || 45000), ...opts });
+  } catch (err) {
+    const e = new Error(err.name === 'TimeoutError' ? `${host} took too long to answer — try again`
+                                                     : `Could not reach ${host} (${err.message})`);
+    e.opaque = true; // no HTTP response at all — timeout, DNS/TCP failure, or a CORS-blocked error
+                      // response (browser hides the status). Indistinguishable from here; callers
+                      // that care (postOverpass) may treat it as transient and retryable.
+    throw e;
+  }
+  if (!res.ok) throw new Error(`${host} returned ${res.status}` +
+    (res.status === 429 ? ' — rate limited, wait a moment and retry' : ''));
+  return res.json();
+}
+
+async function geocode(query) {
+  const j = await getJSON('https://nominatim.openstreetmap.org/search?format=json&limit=1&q=' +
+                          encodeURIComponent(query));
+  if (!j.length) throw new Error(`Could not find "${query}"`);
+  return { lat: +j[0].lat, lon: +j[0].lon, label: j[0].display_name };
+}
+
+// coords: [{lat,lon}, ...], 2+ waypoints, OSRM takes them straight through in order.
+// steps=true costs nothing extra (same request, same host) and is how the speed adjustment
+// and the route labeling get per-segment distance/duration/ref without a second network call.
+// overview defaults to 'full' (the geometry the planner needs); pass 'false' for cheap discovery.
+async function fetchRoute(coords, opts = {}) {
+  const coordStr = coords.map(c => `${c.lon},${c.lat}`).join(';');
+  const params = new URLSearchParams({ overview: opts.overview || 'full', geometries: 'geojson', steps: 'true' });
+  if (opts.alternatives) params.set('alternatives', 'true');
+  const j = await getJSON(`https://router.project-osrm.org/route/v1/driving/${coordStr}?${params}`);
+  if (j.code !== 'Ok' || !j.routes.length) throw new Error('No driving route between those points');
+  return j.routes;
+}
+
+// OSRM only returns alternatives for a plain 2-coordinate request (verified: a 3rd coordinate
+// makes it silently ignore alternatives=true and return exactly one route) — this is that path.
+// Falls back to a single plain route if the alternatives request itself fails.
+async function fetchAlternatives(a, b) {
+  try {
+    const routes = await fetchRoute([a, b], { overview: 'false', alternatives: true });
+    return routes.map(route => ({ route, coords: [a, b] }));
+  } catch {
+    try { return [{ route: (await fetchRoute([a, b], { overview: 'false' }))[0], coords: [a, b] }]; }
+    catch { return []; }
+  }
+}
+
+// Up to 3 distinct corridors between two points: OSRM's own alternatives (at most 2, and only
+// for a 2-coordinate request) plus via-routes through perpendicular offset points (see the
+// OFFSET_* constants). All discovery calls use overview=false — full geometry is fetched only
+// for whichever option the user actually picks (see planCandidate).
+async function discoverCandidates(a, b) {
+  const av = [a.lat, a.lon], bv = [b.lat, b.lon];
+  const offsetCalls = OFFSET_FRACS.flatMap(frac => [1, -1].map(side => {
+    const [lat, lon] = perpOffsetPoint(av, bv, frac, OFFSET_KM, side);
+    const via = { lat, lon };
+    return fetchRoute([a, via, b], { overview: 'false' })
+      .then(routes => [{ route: routes[0], coords: [a, via, b] }]).catch(() => []);
+  }));
+  const [alt, ...offsets] = await Promise.all([fetchAlternatives(a, b), ...offsetCalls]);
+  const all = [alt, ...offsets].flat().sort((x, y) => x.route.distance - y.route.distance);
+  if (!all.length) return [];
+  const shortest = all[0].route.distance;
+  const kept = [];
+  for (const c of all) {
+    if (c.route.distance > shortest * ABSURD_MULT) continue;
+    const sig = corridorSignature(c.route);
+    if (kept.some(k => isDuplicateCorridor(k.sig, sig))) continue;
+    kept.push({ ...c, sig });
+    if (kept.length === 3) break;
+  }
+  const labels = labelCandidates(kept);
+  return kept.map((c, i) => ({ ...c, label: labels[i] }));
+}
+
+// Longest leg in an ordered waypoint chain (index i of pts[i] -> pts[i+1], by haversine) — the
+// natural place to hunt for an alternate corridor once other waypoints are already fixed.
+// ponytail: offsetting around the whole trip's start->end line can land irrelevant once a
+// via-waypoint already forces a dogleg away from that line; offsetting within the longest leg
+// instead targets the one stretch that actually has room for a different road. Verified on the
+// reported trip (see report): Lakewood->Fernley is ~1500km and is exactly where I-70/I-80
+// diverge; Fernley->Black Rock City is ~135km on essentially one road, so anchoring there would
+// waste every discovery call.
+function longestLegIndex(pts) {
+  let best = 0, bestKm = -1;
+  for (let i = 0; i < pts.length - 1; i++) {
+    const km = haversine([pts[i].lat, pts[i].lon], [pts[i + 1].lat, pts[i + 1].lon]);
+    if (km > bestKm) { bestKm = km; best = i; }
+  }
+  return best;
+}
+
+// Splice an anchor into leg [legIdx, legIdx+1] of an ordered waypoint chain — every user waypoint
+// stays present and in its original order (they're constraints the user chose, not the
+// algorithm's to move); only a new via point is added between two of them.
+function insertAnchor(pts, legIdx, anchor) {
+  return [...pts.slice(0, legIdx + 1), anchor, ...pts.slice(legIdx + 1)];
+}
+
+// Corridor discovery for 3+ waypoints. discoverCandidates(a, b) only handles the plain two-point
+// case (OSRM's alternatives=true is silently ignored once a 3rd coordinate is in the request,
+// verified via curl — that's the whole reason this function exists), so this reuses the same
+// perpendicular-offset via-route trick aimed at the longest leg (see longestLegIndex) plus the
+// straight-through route as a baseline, then de-dupes/labels with the exact same machinery
+// discoverCandidates uses. Same discovery cost shape: overview=false, full geometry fetched only
+// for whatever the user picks (see planCandidate).
+// ponytail: doesn't also stitch per-leg alternatives=true results back in — that's a
+// combinatorial blow-up (each leg's alternatives x every other leg) for corridors the offset
+// sweep already covers on the leg that actually has room to differ. Add per-leg stitching if a
+// trip is ever found that needs a 4th distinct option this sweep can't reach.
+async function discoverCandidatesChain(pts) {
+  const straight = fetchRoute(pts, { overview: 'false' })
+    .then(routes => [{ route: routes[0], coords: pts }]).catch(() => []);
+  const legIdx = longestLegIndex(pts);
+  const av = [pts[legIdx].lat, pts[legIdx].lon], bv = [pts[legIdx + 1].lat, pts[legIdx + 1].lon];
+  const offsetCalls = OFFSET_FRACS.flatMap(frac => [1, -1].map(side => {
+    const [lat, lon] = perpOffsetPoint(av, bv, frac, OFFSET_KM, side);
+    const coords = insertAnchor(pts, legIdx, { lat, lon });
+    return fetchRoute(coords, { overview: 'false' })
+      .then(routes => [{ route: routes[0], coords }]).catch(() => []);
+  }));
+  const [str, ...offsets] = await Promise.all([straight, ...offsetCalls]);
+  const all = [str, ...offsets].flat().sort((x, y) => x.route.distance - y.route.distance);
+  if (!all.length) return [];
+  const shortest = all[0].route.distance;
+  const kept = [];
+  for (const c of all) {
+    if (c.route.distance > shortest * ABSURD_MULT) continue;
+    const sig = corridorSignature(c.route);
+    if (kept.some(k => isDuplicateCorridor(k.sig, sig))) continue;
+    kept.push({ ...c, sig });
+    if (kept.length === 3) break;
+  }
+  const labels = labelCandidates(kept);
+  return kept.map((c, i) => ({ ...c, label: labels[i] }));
+}
+
+// Elevation for up to ELEV_BATCH points per request (Open-Meteo's hard cap). Keyless, CORS *.
+// Cached by coordKey (see elevCache) — a coordinate's elevation never changes, so a replanned
+// route (same corridor, same samples) fetches only whatever's genuinely new.
+async function fetchElevations(points) {
+  const keys = points.map(coordKey);
+  const miss = keys.map((k, i) => i).filter(i => !elevCache.has(keys[i]));
+  for (let i = 0; i < miss.length; i += ELEV_BATCH) {
+    const batch = miss.slice(i, i + ELEV_BATCH);
+    const lat = batch.map(i => points[i][0].toFixed(4)).join(',');
+    const lon = batch.map(i => points[i][1].toFixed(4)).join(',');
+    const j = await getJSONRetry(`https://api.open-meteo.com/v1/elevation?latitude=${lat}&longitude=${lon}`);
+    batch.forEach((i, k) => elevCache.set(keys[i], j.elevation[k]));
+  }
+  return keys.map(k => elevCache.get(k));
+}
+
+// Wind for every sample point in one request (up to 200 locations allowed; we send at most
+// ELEV_SAMPLES). Aligned to each point's estimated arrival time so a stop late in a long trip
+// isn't scored against right-now wind. Not cached — unlike elevation/historical wind, a live
+// forecast is only valid for a short while, so caching it would risk silently serving a stale
+// forecast on a later replan.
+// ponytail: ETA is distance-proportional (totalDuration * km/totalKm), not OSRM's real
+// per-segment timing — good enough to land in the right hourly bucket, not to the minute.
+async function fetchWind(points, etaHours) {
+  const lat = points.map(p => p[0].toFixed(4)).join(',');
+  const lon = points.map(p => p[1].toFixed(4)).join(',');
+  const j = await getJSONRetry('https://api.open-meteo.com/v1/forecast?' +
+    `latitude=${lat}&longitude=${lon}&hourly=wind_speed_10m,wind_direction_10m&wind_speed_unit=mph&timezone=UTC`);
+  const perPoint = Array.isArray(j) ? j : [j]; // verified: 1 location -> object, 2+ -> array
+  const now = Date.now();
+  return perPoint.map((p, i) => {
+    const targetMs = now + etaHours[i] * 3600e3;
+    const times = p.hourly.time.map(t => new Date(t + 'Z').getTime()); // timezone=UTC has no offset suffix
+    let idx = times.findIndex(t => t >= targetMs);
+    if (idx < 0) idx = times.length - 1;
+    return { speed: p.hourly.wind_speed_10m[idx], dir: p.hourly.wind_direction_10m[idx] };
+  });
+}
+
+// Typical (climatological) wind for a set of points, vector-averaged over WIND_HIST_YEARS past
+// years around tripDate. Points are grouped by which day of the trip they're reached on (rounded
+// to a whole day from etaHours) so a multi-day trip still asks for the right calendar window per
+// stretch — the same "align to progression" idea fetchWind applies via ETA, just day-grained
+// instead of hour-grained since a year-over-year average has no single "hour" to align to.
+// One request per (day-bucket x year) MINUS whatever's already in histCache — a point's daily
+// wind for a given date range never changes, so a replanned route (same corridor, same trip
+// date) hits cache and fires zero new requests here. Each request still batches every
+// still-missing point in that bucket in one call.
+async function fetchHistoricalWind(points, etaHours, tripDate) {
+  const buckets = new Map(); // day offset from tripDate -> point indices
+  etaHours.forEach((h, i) => {
+    const day = Math.round(h / 24);
+    (buckets.get(day) || buckets.set(day, []).get(day)).push(i);
+  });
+  const obs = points.map(() => []);
+  const iso = d => d.toISOString().slice(0, 10);
+  for (const [day, idxs] of buckets) {
+    const base = new Date(tripDate + 'T00:00:00Z');
+    base.setUTCDate(base.getUTCDate() + day);
+    for (let y = 1; y <= WIND_HIST_YEARS; y++) {
+      const center = new Date(base); center.setUTCFullYear(center.getUTCFullYear() - y);
+      const start = new Date(center); start.setUTCDate(start.getUTCDate() - WIND_HIST_DAY_WINDOW);
+      const end = new Date(center); end.setUTCDate(end.getUTCDate() + WIND_HIST_DAY_WINDOW);
+      const startS = iso(start), endS = iso(end);
+      const keyFor = i => `${coordKey(points[i])}|${startS}|${endS}`;
+      const miss = idxs.filter(i => !histCache.has(keyFor(i)));
+      if (miss.length) {
+        const lat = miss.map(i => points[i][0].toFixed(4)).join(',');
+        const lon = miss.map(i => points[i][1].toFixed(4)).join(',');
+        const j = await getJSONRetry('https://archive-api.open-meteo.com/v1/archive?' +
+          `latitude=${lat}&longitude=${lon}&start_date=${startS}&end_date=${endS}` +
+          `&daily=wind_speed_10m_mean,wind_direction_10m_dominant&wind_speed_unit=mph&timezone=UTC`);
+        const perPoint = Array.isArray(j) ? j : [j]; // same object-vs-array trap as fetchWind
+        miss.forEach((i, k) => histCache.set(keyFor(i), perPoint[k].daily));
+      }
+      idxs.forEach(pi => {
+        const d = histCache.get(keyFor(pi));
+        d.wind_speed_10m_mean.forEach((speed, di) => {
+          if (speed != null) obs[pi].push({ speed, dir: d.wind_direction_10m_dominant[di] });
+        });
+      });
+    }
+  }
+  return obs.map(o => o.length ? windVecMean(o) : null);
+}
+
+// Full-resolution typical wind for a route: fetches at WIND_HIST_SAMPLES sparse points (see the
+// constant's comment) then interpolates each point's u/v components (not speed/dir directly, to
+// avoid the wraparound bug) back onto every sampleKm — same shape buildFuelAxis expects from
+// fetchWind, so it drops into planEconomy without buildFuelAxis knowing the difference.
+async function historicalWinds(sampleKm, samplePts, etaHours, tripDate) {
+  const n = Math.min(WIND_HIST_SAMPLES, samplePts.length);
+  const idxs = Array.from({ length: n }, (_, i) => Math.round(i * (samplePts.length - 1) / (n - 1)));
+  const subKm = idxs.map(i => sampleKm[i]);
+  const subWinds = await fetchHistoricalWind(idxs.map(i => samplePts[i]), idxs.map(i => etaHours[i]), tripDate);
+  const subU = [], subV = [];
+  subWinds.forEach(w => {
+    const c = w ? windToVec(w.speed, w.dir) : { u: 0, v: 0 }; // no data at this point -> treat as calm
+    subU.push(c.u); subV.push(c.v);
+  });
+  return sampleKm.map(km => vecToWind(interpAxis(subKm, subU, km), interpAxis(subKm, subV, km)));
+}
+
+// Points along one stretch of route, spaced so the 3 km search circles still overlap.
+function searchCentres(pts, cum, [from, to]) {
+  const total = cum[cum.length - 1];
+  let step = SEARCH_STEP_KM, centres;
+  do { // Overpass cost climbs fast with centre count — keep each query small
+    centres = [];
+    for (let km = Math.max(0, from); km <= Math.min(total, to); km += step)
+      centres.push(pointAt(pts, cum, km));
+    step *= 2;
+  } while (centres.length > 60);
+  return centres;
+}
+
+// Shared by Overpass and Open-Meteo: a free IP gets a handful of slots and 429s once they're
+// gone, or 503/504 when the instance itself is overloaded — all transient, all worth a
+// wait-and-retry. A fetch that never got a response at all (err.opaque, from getJSON) is the
+// same situation wearing a different browser-side costume: an overloaded host often answers
+// from a front-end gateway that drops CORS headers, so the browser hides the status and fetch
+// just rejects — indistinguishable here from a plain dropped connection, and either way
+// retrying is the right call. A real HTTP status that isn't 429/503/504 (e.g. 400 from a
+// malformed query) is a programming error, not transient — fail fast.
+function transientRetryable(err) {
+  return !!err.opaque || /429|503|504/.test(err.message);
+}
+// Open-Meteo's 429 is our own burst hitting its per-minute cap, not a real outage — worth a
+// retry, but capped low (3 tries, ~1s+2s wait) so a genuine failure still surfaces in a few
+// seconds instead of hanging: that's what the existing degrade-to-"unadjusted" path is for.
+async function getJSONRetry(url, attempts = 3) {
+  for (let i = 0; ; i++) {
+    try { return await getJSON(url); }
+    catch (err) {
+      if (i === attempts - 1 || !transientRetryable(err)) throw err;
+      await new Promise(done => setTimeout(done, 1000 * (i + 1)));
+    }
+  }
+}
+async function postOverpass(query) {
+  const body = 'data=' + encodeURIComponent(query);
+  let last;
+  for (const endpoint of OVERPASS_ENDPOINTS) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        return await getJSON(endpoint, { method: 'POST', body, timeout: 65000, // > server's own [timeout:60]
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
+      } catch (err) {
+        last = err;
+        if (!transientRetryable(err)) throw err; // a real failure, don't hammer
+        say('Overpass is busy, waiting…');
+        await new Promise(done => setTimeout(done, 5000 * (attempt + 1)));
+      }
+    }
+  }
+  throw new Error(`Overpass (the fuel-station lookup) could not be reached or is overloaded right now ` +
+    `(${last.message}). Wait a minute and try again.`);
+}
+
+async function overpassFuel(centres) {
+  const around = centres.map(p => `${p[0].toFixed(5)},${p[1].toFixed(5)}`).join(',');
+  const j = await postOverpass(
+    `[out:json][timeout:60];nwr(around:${SEARCH_RADIUS_M},${around})[amenity=fuel];out center 300;`);
+  return j.elements.map(el => {
+    const lat = el.lat ?? el.center?.lat, lon = el.lon ?? el.center?.lon;
+    if (lat == null) return null;
+    const t = el.tags || {};
+    return { lat, lon, name: t.name || t.brand || t.operator || 'Unnamed fuel station',
+             brand: t.brand || '', open: t['opening_hours'] || '' };
+  }).filter(Boolean);
+}
+
+// One query per stretch where a stop could land, run one at a time. A single query
+// covering every stretch at once took 86 s on a Denver->Nevada route and blew the
+// browser's network timeout; split up, each comes back in under ten seconds.
+async function fetchStations(pts, cum, windows) {
+  const found = [];
+  for (const [i, window] of windows.entries()) {
+    say(`Looking for gas stations… stretch ${i + 1} of ${windows.length}`);
+    found.push(...await overpassFuel(searchCentres(pts, cum, window)));
+  }
+  return [...new Map(found.map(s => [`${s.lat},${s.lon}`, s])).values()]; // windows can overlap
+}
+
+// --- the actual planning ---------------------------------------------------
+
+// Greedy: from each position, take the furthest station still inside range,
+// discounted by how far off-route it sits (in the same fuel-adjusted km as `km`, via
+// adjDetour — falls back to raw `detour` for callers that don't carry both, where the two
+// are equivalent anyway). Furthest-first minimises stop count.
+function planStops(stations, totalKm, firstLegKm, legKm) {
+  const stops = [];
+  let position = 0, reach = firstLegKm;
+  const cost = s => s.km - DETOUR_WEIGHT * (s.adjDetour ?? s.detour);
+
+  while (position + reach < totalKm) {
+    const limit = position + reach;
+    let candidates = stations.filter(s => s.km > position + reach * 0.6 && s.km <= limit);
+    if (!candidates.length)
+      candidates = stations.filter(s => s.km > position + reach * 0.3 && s.km <= limit);
+    if (!candidates.length) return { stops, gap: [position, limit] };
+
+    const pick = candidates.reduce((a, b) => cost(b) > cost(a) ? b : a);
+    stops.push({ ...pick, leg: pick.km - position });
+    position = pick.km;
+    reach = legKm;
+  }
+  return { stops, finalLeg: totalKm - position };
+}
+
+// Samples the route, fetches terrain/wind, and turns them into a fuel-adjusted distance axis.
+// Never throws: a failed Open-Meteo call degrades that one effect to "no adjustment" and gets
+// reported in `notes`, so a weather-API outage never blocks stop planning.
+async function planEconomy(pts, cum, route, overLimitMph, windBasis = 'live', windDate = null) {
+  const totalKm = cum[cum.length - 1];
+  const n = Math.min(ELEV_SAMPLES, pts.length);
+  const sampleKm = Array.from({ length: n }, (_, i) => totalKm * i / (n - 1));
+  const samplePts = sampleKm.map(km => pointAt(pts, cum, km));
+  const steps = stepSpeeds(route);
+  const notes = [];
+
+  let elevations = null;
+  try { elevations = await fetchElevations(samplePts); }
+  catch (err) { notes.push(`terrain (${err.message})`); }
+
+  let winds = null;
+  try {
+    const etaHours = sampleKm.map(km => (route.duration / 3600) * (km / totalKm));
+    winds = windBasis === 'typical'
+      ? await historicalWinds(sampleKm, samplePts, etaHours, windDate)
+      : await fetchWind(samplePts, etaHours);
+  } catch (err) { notes.push(`wind (${err.message})`); }
+
+  return { sampleKm, notes, windBasis, windDate, ...buildFuelAxis(sampleKm, samplePts, elevations, winds, steps, overLimitMph) };
+}
+
+// --- export: Google Maps directions + KML -----------------------------------
+// Verified 2026-08-05 against Google's own Maps URLs docs (developers.google.com/maps/
+// documentation/urls/get-started): the dir/?api=1 `waypoints` param supports "up to three
+// waypoints... on mobile browsers, and a maximum of nine... otherwise." Undocumented what
+// happens past that (not a clean error) — so we never let a link exceed it. Using the lower,
+// mobile number: this app's whole point is stops read from a moving car, most likely on a phone.
+const GMAPS_MAX_WAYPOINTS = 3;
+
+// Splits an ordered point list into consecutive origin->...->destination legs of at most
+// `max` via-points each. Each leg's last point is the next leg's first, so the full sequence
+// is covered with no gap and no point dropped.
+function splitLegs(points, max) {
+  const chunk = max + 2; // + origin + destination
+  if (points.length <= chunk) return [points];
+  const legs = [];
+  let start = 0;
+  while (start < points.length - 1) {
+    const end = Math.min(start + chunk - 1, points.length - 1);
+    legs.push(points.slice(start, end + 1));
+    start = end;
+  }
+  return legs;
+}
+
+function gmapsDirUrl(points) {
+  const o = points[0], d = points[points.length - 1], via = points.slice(1, -1);
+  const p = new URLSearchParams({ api: '1', origin: `${o.lat},${o.lon}`, destination: `${d.lat},${d.lon}` });
+  if (via.length) p.set('waypoints', via.map(w => `${w.lat},${w.lon}`).join('|'));
+  return `https://www.google.com/maps/dir/?${p}`;
+}
+
+// One URL per leg (pre-split to respect GMAPS_MAX_WAYPOINTS), labelled by its endpoints so a
+// multi-leg export is unambiguous about which link covers which stretch of the trip.
+function buildDirectionsUrls(points) {
+  const legs = splitLegs(points, GMAPS_MAX_WAYPOINTS);
+  return legs.map((leg, i) => ({
+    url: gmapsDirUrl(leg),
+    label: legs.length > 1 ? `Leg ${i + 1}/${legs.length}: ${leg[0].name} → ${leg[leg.length - 1].name}` : 'Directions',
+  }));
+}
+
+function escapeXml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' }[c]));
+}
+
+// Google My Maps' import format — consumer Google Maps has no file-import at all; My Maps takes
+// KML/KMZ/CSV/XLSX (verified via My Maps' own import help page, 2026-08-05). KML carries both
+// the named, described stops and the driven route line in one file, so that's what this builds.
+function buildKml(name, points, routePts) {
+  const marks = points.map(p =>
+    `<Placemark><name>${escapeXml(p.name)}</name><description>${escapeXml(p.desc || '')}</description>` +
+    `<Point><coordinates>${p.lon},${p.lat},0</coordinates></Point></Placemark>`).join('');
+  const line = (routePts && routePts.length)
+    ? `<Placemark><name>Route</name><LineString><tessellate>1</tessellate><coordinates>` +
+      routePts.map(([lat, lon]) => `${lon},${lat},0`).join(' ') + `</coordinates></LineString></Placemark>`
+    : '';
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<kml xmlns="http://www.opengis.net/kml/2.2"><Document>` +
+    `<name>${escapeXml(name)}</name>${marks}${line}</Document></kml>`;
+}
+
+// Merges user waypoints (from legBounds, cumulative real km/duration) and planned fuel stops
+// (real km + .legDurationS, the interval since the previous fill) into one route-ordered list.
+// Pure — takes the currentTrip seam plus its .stops extension, no DOM.
+function exportSequence(trip) {
+  if (!trip) return [];
+  const wp = trip.waypoints.map((w, i) => ({
+    lat: w.lat, lon: w.lon,
+    name: w.label ? w.label.split(',')[0] : `waypoint ${i + 1}`,
+    km: trip.legBounds[i].distKm, durationS: trip.legBounds[i].durationS,
+  }));
+  let cum = 0;
+  const st = (trip.stops || []).map(s => {
+    cum += s.legDurationS;
+    return { lat: s.lat, lon: s.lon, name: s.name, km: s.realKm, durationS: cum };
+  });
+  return [...wp, ...st].sort((a, b) => a.km - b.km);
+}
+
+// --- waypoint operations (pure) -----------------------------------------------
+
+function moveWaypoint(list, from, to) {
+  const newList = [...list];
+  const item = newList.splice(from, 1)[0];
+  newList.splice(to, 0, item);
+  return newList;
+}
+
+function insertWaypoint(list, index) {
+  const newList = [...list];
+  newList.splice(index, 0, '');
+  return newList;
+}
+
+// --- UI --------------------------------------------------------------------
+
+const $ = id => document.getElementById(id);
+const mi = km => Math.round(km / KM_PER_MI);
+const map = L.map('map').setView([39.8, -98.6], 4);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+  { maxZoom: 19, attribution: '© OpenStreetMap' }).addTo(map);
+let drawn = L.layerGroup().addTo(map);
+let routeLineLayer = null; // the plain polyline drawn before economy is known; swapped for
+                            // per-segment colour once planEconomy resolves — see drawEconLine.
+
+function say(msg, isError) { $('status').textContent = msg; $('status').className = isError ? 'err' : ''; }
+
+// --- waypoints ---------------------------------------------------------------
+// Ordered destination list, min 2 rows. Persisted to localStorage alongside the vehicle so a
+// trip survives reload. Plain text inputs, no drag-and-drop — reorder by editing the text.
+
+const WPKEY = 'gasplan.waypoints';
+let waypoints = ['Denver, CO', 'Chicago, IL'];
+
+function renderWaypoints() {
+  $('waypoints').innerHTML = waypoints.map((v, i) => {
+    const btns = `
+      <button type="button" class="up" data-i="${i}" title="move up" ${i === 0 ? 'disabled' : ''}>▲</button>
+      <button type="button" class="dn" data-i="${i}" title="move down" ${i === waypoints.length - 1 ? 'disabled' : ''}>▼</button>
+      <button type="button" class="ins" data-i="${i}" title="insert">+</button>
+      ${waypoints.length > 2 ? `<button type="button" class="rm" data-i="${i}" title="remove">×</button>` : ''}`;
+    return `
+    <div class="wp-row">
+      <input class="wp" data-i="${i}" value="${v.replace(/"/g, '&quot;')}">
+      ${btns}
+    </div>`;
+  }).join('');
+}
+function saveWaypoints() { localStorage.setItem(WPKEY, JSON.stringify(waypoints)); }
+
+function clearPlanResults() {
+  $('stops').innerHTML = '';
+  $('econ').innerHTML = '';
+  $('wpInfo').innerHTML = '';
+  $('routeOptions').innerHTML = '';
+  $('cmpBtn').style.display = 'none';
+  $('compare').innerHTML = '';
+  $('exportOut').innerHTML = '';
+  drawn.clearLayers(); // bug fix: a reorder/insert left the stale route polyline drawn with every panel empty
+}
+
+$('waypoints').addEventListener('input', e => {
+  if (!e.target.classList.contains('wp')) return;
+  waypoints[+e.target.dataset.i] = e.target.value;
+  saveWaypoints();
+});
+
+$('waypoints').addEventListener('click', e => {
+  const i = +e.target.dataset.i;
+  if (e.target.classList.contains('up') && i > 0) {
+    waypoints = moveWaypoint(waypoints, i, i - 1);
+    renderWaypoints(); saveWaypoints(); clearPlanResults();
+  } else if (e.target.classList.contains('dn') && i < waypoints.length - 1) {
+    waypoints = moveWaypoint(waypoints, i, i + 1);
+    renderWaypoints(); saveWaypoints(); clearPlanResults();
+  } else if (e.target.classList.contains('ins')) {
+    waypoints = insertWaypoint(waypoints, i + 1);
+    renderWaypoints(); saveWaypoints(); clearPlanResults();
+  } else if (e.target.classList.contains('rm') && waypoints.length > 2) {
+    waypoints.splice(i, 1);
+    renderWaypoints(); saveWaypoints(); clearPlanResults();
+  }
+});
+
+$('addWp').addEventListener('click', () => { waypoints.push(''); renderWaypoints(); saveWaypoints(); });
+
+function restoreWaypoints() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(WPKEY));
+    if (Array.isArray(raw) && raw.length >= 2) waypoints = raw;
+  } catch { /* corrupt/stale value — defaults already set */ }
+  renderWaypoints();
+}
+restoreWaypoints();
+
+// --- vehicle lookup (fueleconomy.gov) ---------------------------------------
+// Seam for the physics agent: vehicle() is the one place that reads mpg/gallons
+// off the DOM. Read vehicle().mpg / .gallons / .rangeMi, don't re-read the inputs.
+
+const EPA = 'https://www.fueleconomy.gov/ws/rest/vehicle/';
+const VKEY = 'gasplan.vehicle';
+
+async function epaMenu(path, params) {
+  const qs = new URLSearchParams(params).toString();
+  const j = await getJSON(`${EPA}menu/${path}${qs ? '?' + qs : ''}`, { headers: { Accept: 'application/json' } });
+  return [].concat(j.menuItem || []); // a single-result menu comes back as a bare object, not an array
+}
+
+function fillSelect(sel, items, placeholder) {
+  sel.innerHTML = `<option value="">${placeholder}</option>` +
+    items.map(i => `<option value="${i.value}">${i.text}</option>`).join('');
+  sel.disabled = false;
+}
+function resetSelect(sel, placeholder) { sel.innerHTML = `<option value="">${placeholder}</option>`; sel.disabled = true; }
+
+function vehicle() {
+  const mpg = +$('mpg').value, gallons = +$('gal').value;
+  return { mpg, gallons, rangeMi: vehicleRange(mpg, gallons) };
+}
+function updateRange() {
+  const r = vehicle().rangeMi;
+  $('rangeInfo').textContent = r > 0 ? `≈ ${Math.round(r)} mi on a full tank` : '';
+}
+function saveVehicle() {
+  localStorage.setItem(VKEY, JSON.stringify({
+    y: $('vy').value, mk: $('vmk').value, md: $('vmd').value, tr: $('vtr').value,
+    mpg: $('mpg').value, gal: $('gal').value,
+  }));
+}
+
+$('vy').addEventListener('change', async () => {
+  resetSelect($('vmk'), 'Make…'); resetSelect($('vmd'), 'Model…'); resetSelect($('vtr'), 'Trim…');
+  if (!$('vy').value) return;
+  try { fillSelect($('vmk'), await epaMenu('make', { year: $('vy').value }), 'Make…'); }
+  catch (err) { say(err.message, true); }
+});
+$('vmk').addEventListener('change', async () => {
+  resetSelect($('vmd'), 'Model…'); resetSelect($('vtr'), 'Trim…');
+  if (!$('vmk').value) return;
+  try { fillSelect($('vmd'), await epaMenu('model', { year: $('vy').value, make: $('vmk').value }), 'Model…'); }
+  catch (err) { say(err.message, true); }
+});
+$('vmd').addEventListener('change', async () => {
+  resetSelect($('vtr'), 'Trim…');
+  if (!$('vmd').value) return;
+  try { fillSelect($('vtr'), await epaMenu('options', { year: $('vy').value, make: $('vmk').value, model: $('vmd').value }), 'Trim…'); }
+  catch (err) { say(err.message, true); }
+});
+// Tank (gal) auto-fills from the vehicle's EPA size class (see VCLASS_TANK_GAL — it's an
+// estimate, not the real tank) but a user edit always wins: once they touch the field by hand,
+// picking a different trim no longer overwrites it for the rest of the session.
+let galEdited = false;
+$('vtr').addEventListener('change', async () => {
+  if (!$('vtr').value) return;
+  try {
+    const d = await getJSON(EPA + $('vtr').value, { headers: { Accept: 'application/json' } });
+    $('mpg').value = d.highway08;
+    if (!galEdited) {
+      $('gal').value = tankFromVClass(d.VClass);
+      $('tankNote').textContent = `Tank estimated from vehicle class (${d.VClass}) — check your manual.`;
+    }
+    updateRange(); saveVehicle();
+  } catch (err) { say(err.message, true); }
+});
+$('mpg').addEventListener('input', () => { updateRange(); saveVehicle(); });
+$('gal').addEventListener('input', () => { galEdited = true; $('tankNote').textContent = ''; updateRange(); saveVehicle(); });
+
+// Restore last pick from localStorage: mpg/gallons are instant, the dropdown
+// chain is a best-effort re-fetch that quietly gives up if EPA is unreachable.
+async function restoreVehicle() {
+  updateRange();
+  try { fillSelect($('vy'), await epaMenu('year'), 'Year…'); } catch (err) { say(err.message, true); return; }
+  const raw = localStorage.getItem(VKEY);
+  if (!raw) return;
+  let v;
+  try { v = JSON.parse(raw); } catch { return; } // corrupt/stale value — ignore, defaults already set
+  $('mpg').value = v.mpg || $('mpg').value;
+  $('gal').value = v.gal || $('gal').value;
+  updateRange();
+  if (!v.y) return;
+  try {
+    $('vy').value = v.y;
+    fillSelect($('vmk'), await epaMenu('make', { year: v.y }), 'Make…');
+    if (!v.mk) return;
+    $('vmk').value = v.mk;
+    fillSelect($('vmd'), await epaMenu('model', { year: v.y, make: v.mk }), 'Model…');
+    if (!v.md) return;
+    $('vmd').value = v.md;
+    fillSelect($('vtr'), await epaMenu('options', { year: v.y, make: v.mk, model: v.md }), 'Trim…');
+    if (v.tr) $('vtr').value = v.tr;
+  } catch (err) { /* picker restore failed — mpg/gallons above already have the real values */ }
+}
+restoreVehicle();
+
+// Seam for the next agents: set once a candidate has been fully routed and planned.
+// legBounds[i] = {distKm, durationS} cumulative real distance/duration through waypoint i
+// (legBounds[0] = the start, 0/0) — read this instead of reconstructing legs from geometry.
+// route.legs[] (raw OSRM) and waypoints (the geocoded {lat,lon,label} list) are also here.
+let currentTrip = null;
+
+async function run() {
+  $('go').disabled = true;
+  $('stops').innerHTML = '';
+  $('econ').innerHTML = '';
+  $('wpInfo').innerHTML = '';
+  $('routeOptions').innerHTML = '';
+  $('cmpBtn').style.display = 'none';
+  $('compare').innerHTML = '';
+  $('exportOut').innerHTML = '';
+  drawn.clearLayers();
+  try {
+    const baseMpg = vehicle().mpg;
+    const rangeKm = vehicle().rangeMi * KM_PER_MI;
+    const reserve = +$('reserve').value / 100;
+    const startFuel = +$('fuel').value / 100;
+    const overLimitMph = +$('over').value || 0;
+    const windBasis = $('windBasis').value;
+    const windDate = $('windDate').value;
+    if (!(rangeKm > 0)) throw new Error('Set highway mpg and tank gallons to compute a range');
+    if (reserve < 0 || reserve >= 1) throw new Error('Reserve must be between 0 and 99%');
+    if (startFuel <= reserve) throw new Error('Starting fuel is already at or below your reserve');
+    if (windBasis === 'typical' && !windDate) throw new Error('Pick a date for typical wind, or switch back to live forecast');
+
+    const queries = waypoints.map(w => w.trim()).filter(Boolean);
+    if (queries.length < 2) throw new Error('Add at least a start and a destination');
+
+    say('Finding waypoints…');
+    const pts0 = await Promise.all(queries.map(geocode));
+
+    say('Finding route options…');
+    // Two waypoints: OSRM's own alternatives=true plus perpendicular offset via-routes (see
+    // discoverCandidates). 3+ waypoints: alternatives=true is silently ignored past 2
+    // coordinates, so discoverCandidatesChain keeps every user waypoint fixed & in order and
+    // hunts for an alternate corridor only within the longest leg (see longestLegIndex).
+    let candidates;
+    if (pts0.length === 2) {
+      candidates = await discoverCandidates(pts0[0], pts0[1]);
+    } else {
+      candidates = await discoverCandidatesChain(pts0);
+    }
+    if (!candidates.length) throw new Error('OSRM returned no usable route for these waypoints');
+
+    const ctx = { baseMpg, rangeKm, reserve, startFuel, overLimitMph, windBasis, windDate };
+    renderOptions(candidates, ctx);
+    if (candidates.length === 1) {
+      $('routeOptions').firstElementChild?.classList.add('sel');
+      await planCandidate(candidates[0], ctx);
+    } else {
+      say(`${candidates.length} route options found — pick one to plan fuel stops, or compare them first.` +
+        (candidates.length < 3 ? ' (Fewer than 3 distinct corridors survived — add a via-destination to force a different one.)' : ''));
+      // On demand, not eager: comparing every corridor means a full terrain+wind fetch per
+      // corridor (see compareCandidates) — firing that on every "Plan route" click is real
+      // Open-Meteo volume (measured: a 3-corridor comparison alone was the majority of a click's
+      // requests) against a rate-limited, keyless API. Caching (elevCache/histCache) makes a
+      // repeat click free, but a cold first click shouldn't pay for a comparison the user hasn't
+      // asked to see yet.
+      const cmpBtn = $('cmpBtn');
+      cmpBtn.style.display = '';
+      cmpBtn.onclick = async () => {
+        cmpBtn.disabled = true;
+        try { await compareCandidates(candidates, baseMpg, overLimitMph, windBasis, windDate); }
+        finally { cmpBtn.disabled = false; }
+      };
+    }
+  } catch (err) {
+    say(err.message, true);
+  } finally {
+    $('go').disabled = false;
+  }
+}
+
+function renderOptions(candidates, ctx) {
+  const shortest = candidates.reduce((a, c) => Math.min(a, c.route.distance), Infinity);
+  const shortestDur = candidates.find(c => c.route.distance === shortest).route.duration;
+  $('routeOptions').innerHTML = candidates.map((c, i) => {
+    const pctD = (c.route.distance / shortest - 1) * 100;
+    const dh = (c.route.duration - shortestDur) / 3600;
+    const cmp = pctD < 0.5 ? 'shortest' : `+${pctD.toFixed(1)}%, +${dh.toFixed(1)}h`;
+    return `<div class="opt" data-i="${i}">
+      <div class="name">${c.label}</div>
+      <div class="meta">${mi(c.route.distance / 1000)} mi · ${(c.route.duration / 3600).toFixed(1)} h · ${cmp}</div>
+    </div>`;
+  }).join('');
+  [...$('routeOptions').children].forEach((el, i) => el.addEventListener('click', async () => {
+    [...$('routeOptions').children].forEach(o => o.classList.remove('sel'));
+    el.classList.add('sel');
+    await planCandidate(candidates[i], ctx);
+  }));
+}
+
+// The rest of the pipeline (full geometry, terrain/wind, Overpass, greedy stop planning) runs
+// only for the option the user picked — Overpass and Open-Meteo are never spent on candidates
+// that don't get chosen.
+async function planCandidate(candidate, { baseMpg, rangeKm, reserve, startFuel, overLimitMph, windBasis, windDate }) {
+  $('go').disabled = true;
+  $('stops').innerHTML = '';
+  $('econ').innerHTML = '';
+  $('wpInfo').innerHTML = '';
+  $('exportOut').innerHTML = '';
+  drawn.clearLayers();
+  try {
+    const legKm = rangeKm * (1 - reserve);
+    const firstLegKm = rangeKm * (startFuel - reserve);
+
+    say('Routing…');
+    // A 2-coordinate candidate came from the alternatives call — re-request alternatives to get
+    // the same corridor back (index order isn't guaranteed, so match on distance) rather than the
+    // single default route a plain request would give. A via-route (3+ coords) is unambiguous.
+    const twoPoint = candidate.coords.length === 2;
+    const routes = await fetchRoute(candidate.coords, twoPoint ? { overview: 'full', alternatives: true } : { overview: 'full' });
+    const route = twoPoint
+      ? routes.reduce((best, r) => Math.abs(r.distance - candidate.route.distance) < Math.abs(best.distance - candidate.route.distance) ? r : best)
+      : routes[0];
+    const pts = route.geometry.coordinates.map(c => [c[1], c[0]]);
+    const cum = cumulate(pts);
+    const totalKm = cum[cum.length - 1];
+    currentTrip = { waypoints: candidate.coords, route, legBounds: legBoundaries(route), stops: [] };
+
+    routeLineLayer = L.polyline(pts, { color: '#2563eb', weight: 4, opacity: .7 }).addTo(drawn);
+    map.fitBounds(L.latLngBounds(pts).pad(0.05));
+
+    say('Checking terrain and wind…');
+    const econ = await planEconomy(pts, cum, route, overLimitMph, windBasis, windDate);
+    renderEconomy(econ, baseMpg);
+    const { sampleKm, adjCum } = econ;
+    const adjTotalKm = adjCum[adjCum.length - 1];
+    const toReal = km => interpAxis(adjCum, sampleKm, km); // fuel-adjusted -> real km
+    const toAdj = km => interpAxis(sampleKm, adjCum, km);  // real -> fuel-adjusted km
+    const kmPerGal = baseMpg * KM_PER_MI; // nominal-condition km per gallon — the unit adjCum is in
+    const tankGal = rangeKm / kmPerGal;
+    const totalGal = adjTotalKm / kmPerGal; // same axis as effective mpg — see renderTripFuel
+
+    if (adjTotalKm <= firstLegKm) {
+      const fuel = fuelAtWaypoints(currentTrip.legBounds, [], toAdj, kmPerGal, tankGal, startFuel);
+      renderWaypointArrivals(currentTrip.legBounds, currentTrip.waypoints, fuel.waypoints, reserve);
+      renderTripFuel(totalGal, 0);
+      say(`${mi(totalKm)} mi, ~${(route.duration / 3600).toFixed(1)} h — no fuel stop needed.`);
+      return;
+    }
+
+    // Search windows (in real km — what fetchStations works in) around each ideal stop point on
+    // the fuel-adjusted axis, generous so the greedy pass still has options when it lands short.
+    const windows = [];
+    for (let d = firstLegKm; d < adjTotalKm; d += legKm) windows.push([toReal(d - legKm * 0.5), toReal(d) + 5]);
+
+    const raw = await fetchStations(pts, cum, windows);
+    if (!raw.length) throw new Error('No gas stations found near this route in OpenStreetMap');
+
+    // Each station carries both positions: `km` (fuel-adjusted) drives planStops below,
+    // `realKm` is what gets shown to the user as the mile marker. Likewise `detour` (real km,
+    // for display — "0.4 mi off route" must stay a real mile) vs `adjDetour` (the same detour
+    // burned at the local fuel-cost rate, so planStops compares apples to apples against `km`).
+    const stations = raw.map(s => {
+      const proj = project([s.lat, s.lon], pts, cum);
+      const rate = axisRate(sampleKm, adjCum, proj.km);
+      return { ...s, detour: proj.detour, adjDetour: proj.detour * rate, realKm: proj.km, km: toAdj(proj.km) };
+    }).filter(s => s.detour < 3.5);
+
+    const { stops, gap, finalLeg } = planStops(stations, adjTotalKm, firstLegKm, legKm);
+    const stepCum = stepCumulative(route);
+    const durAt = km => interpAxis(stepCum.km, stepCum.s, km); // real km -> cumulative seconds
+    stops.forEach((s, i) => {
+      s.realLeg = s.realKm - (i ? stops[i - 1].realKm : 0);
+      s.legDurationS = durAt(s.realKm) - (i ? durAt(stops[i - 1].realKm) : 0);
+    });
+    const finalLegDurationS = route.duration - (stops.length ? durAt(stops[stops.length - 1].realKm) : 0);
+    currentTrip.stops = stops;
+    const fuel = fuelAtWaypoints(currentTrip.legBounds, stops, toAdj, kmPerGal, tankGal, startFuel);
+    renderWaypointArrivals(currentTrip.legBounds, currentTrip.waypoints, fuel.waypoints, reserve);
+    render(stops, totalKm, route, finalLegDurationS, fuel.stops, reserve);
+    renderTripFuel(totalGal, stops.length);
+    if (gap) $('panel').insertAdjacentHTML('beforeend',
+      `<div class="warn">No mapped station between mile ${mi(toReal(gap[0]))} and ${mi(toReal(gap[1]))} — ` +
+      `that stretch needs more range than ${mi(legKm)} mi. Stops beyond it are not planned.</div>`);
+    else if (finalLeg > legKm * 0.9) {
+      const finalLegReal = totalKm - (stops.length ? stops[stops.length - 1].realKm : 0);
+      $('panel').insertAdjacentHTML('beforeend',
+        `<div class="warn">Final leg is ${mi(finalLegReal)} mi — close to your ${mi(legKm)} mi usable range.</div>`);
+    }
+  } catch (err) {
+    say(err.message, true);
+  } finally {
+    $('go').disabled = false;
+  }
+}
+
+function renderEconomy(econ, baseMpg) {
+  const eff = baseMpg * econ.overallFactor;
+  const pct = p => (p >= 0 ? '+' : '') + p.toFixed(0) + '%';
+  let html = `<div class="meta">Based on ${windBasisLabel(econ.windBasis, econ.windDate)}.</div>` +
+    `Effective mpg ≈ ${eff.toFixed(1)} (base ${baseMpg}) — terrain ${pct(econ.terrainPct)} · ` +
+    `wind ${pct(econ.windPct)} · speed ${pct(econ.speedPct)} <span class="meta">(+ = burns more fuel)</span>`;
+  if (econ.notes.length) html += `<div class="warn">Adjustment unavailable: ${econ.notes.join('; ')} — ` +
+    `planned with unadjusted economy for that part.</div>`;
+  html += renderSegmentDetail(econ.segments);
+  $('econ').innerHTML = html;
+  drawEconLine(econ.segments);
+}
+
+// Per-segment strip, collapsed by default (native <details>, no JS toggle needed) so it doesn't
+// crowd the 380px panel. Bucketed via aggregateSegments — one row per sample would be ~150 rows.
+function renderSegmentDetail(segments) {
+  if (!segments.length) return '';
+  const pct = p => (p >= 0 ? '+' : '') + Math.round(p) + '%';
+  const swatch = f => `<span style="display:inline-block;width:14px;height:10px;vertical-align:middle;` +
+    `background:${factorColor(f)};border:1px solid var(--line)"></span>`;
+  const legend = `${swatch(FACTOR_SCALE_LO)} worse &nbsp; ${swatch(1)} neutral &nbsp; ${swatch(FACTOR_SCALE_HI)} better`;
+  const rows = aggregateSegments(segments, SEGMENT_PANEL_ROWS).map(s => `
+    <div style="display:flex;gap:5px;align-items:center;font-size:11px;padding:3px 0;border-top:1px solid var(--line)">
+      ${swatch(s.factor)}
+      <span style="flex:1.2">mi ${mi(s.fromKm)}–${mi(s.toKm)}</span>
+      <span style="flex:1">terrain ${pct(s.terrainPct)}</span>
+      <span style="flex:1">wind ${pct(s.windPct)}</span>
+      <span style="flex:1">speed ${pct(s.speedPct)}</span>
+    </div>`).join('');
+  return `<details style="margin-top:8px">
+    <summary style="cursor:pointer">Per-segment breakdown</summary>
+    <div class="meta" style="margin:6px 0">${legend} — coefficients are physically-reasoned estimates,
+      not measured (except speed, a published DOE figure); grade is averaged over multi-km spans so it
+      understates short steep pitches.</div>
+    ${rows}</details>`;
+}
+
+// Colours the route on the map by each segment's combined factor, replacing the plain line drawn
+// before economy was known. Hover a segment for its numbers — same data as the panel rows above,
+// just at full sample resolution instead of bucketed.
+function drawEconLine(segments) {
+  if (!segments.length) return; // no elevation/wind samples at all — leave the plain line as-is
+  if (routeLineLayer) { routeLineLayer.remove(); routeLineLayer = null; }
+  const pct = f => (f >= 1 ? '+' : '') + Math.round((f - 1) * 100) + '%';
+  segments.forEach(s => {
+    L.polyline([s.fromPt, s.toPt], { color: factorColor(s.factor), weight: 5, opacity: .85 })
+      .bindTooltip(`mi ${mi(s.fromKm)} – terrain ${pct(1 / s.terrain)} · wind ${pct(1 / s.wind)} ` +
+        `· speed ${pct(1 / s.speed)} · net ${pct(1 / s.factor)}`)
+      .addTo(drawn);
+  });
+}
+
+// Corridor comparison (need B): runs planEconomy for every discovered-but-unpicked option so the
+// user can weigh e.g. I-80/Wyoming (wind+speed) against I-70/Colorado (terrain) before choosing.
+// Costs only Open-Meteo (elevation+wind), never Overpass — see pointsFromSteps for why no extra
+// OSRM request is needed either. Triggered on demand (see run()'s #cmpBtn wiring), not eagerly —
+// measured at up to 3 corridors x (elevation + WIND_HIST_YEARS-per-bucket historical wind)
+// requests, real volume against a keyless, rate-limited API. Cached (elevCache/histCache), so a
+// repeat click on the same corridors costs nothing new.
+async function compareCandidates(candidates, baseMpg, overLimitMph, windBasis, windDate) {
+  $('compare').innerHTML = '<div class="meta">Comparing corridors on terrain/wind/speed…</div>';
+  // Sequential, not Promise.all: firing every corridor's elevation+wind calls at once triggered
+  // genuine Open-Meteo 429s (verified in a real browser, 2026-08-05), silently losing the
+  // comparison. At most 3 corridors, so one-at-a-time costs a couple of extra seconds, not a queue.
+  const results = [];
+  for (const c of candidates) {
+    const pts = pointsFromSteps(c.route);
+    results.push(pts ? { label: c.label, econ: await planEconomy(pts, cumulate(pts), c.route, overLimitMph, windBasis, windDate) }
+                      : { label: c.label, econ: null });
+  }
+  renderComparison(results, baseMpg, windBasis, windDate);
+}
+
+// "typical" wind is a WIND_HIST_YEARS-year climatology for the chosen date, not a prediction — see
+// windDate's honesty note in the panel; keep that distinction visible everywhere the numbers show.
+function windBasisLabel(windBasis, windDate) {
+  if (windBasis !== 'typical') return 'live forecast wind';
+  const d = new Date(windDate + 'T00:00:00Z');
+  const label = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' });
+  return `typical wind for ${label} (${WIND_HIST_YEARS}-yr average, not a forecast)`;
+}
+
+function renderComparison(results, baseMpg, windBasis, windDate) {
+  const pct = p => (p >= 0 ? '+' : '') + p.toFixed(0) + '%';
+  const effs = results.map(r => r.econ ? baseMpg * r.econ.overallFactor : -Infinity);
+  const bestI = effs.indexOf(Math.max(...effs));
+  $('compare').innerHTML = `<div class="name">Corridor comparison</div><div class="meta">Based on ${windBasisLabel(windBasis, windDate)}.</div>` + results.map((r, i) => {
+    if (!r.econ) return `<div>${r.label}: economy unavailable</div>`;
+    const label = i === bestI ? `<b>${r.label} — best economy</b>` : r.label;
+    return `<div style="margin-top:4px">${label}: ${effs[i].toFixed(1)} mpg eff. — ` +
+      `terrain ${pct(r.econ.terrainPct)} · wind ${pct(r.econ.windPct)} · speed ${pct(r.econ.speedPct)}` +
+      (r.econ.notes.length ? ' <span class="meta">(partial data)</span>' : '') + `</div>`;
+  }).join('');
+}
+
+// Driving time and fuel-on-arrival for each user waypoint (start excluded — that's the fuel-%
+// input, not an estimate). `fuel` is fuelAtWaypoints().waypoints — computed once by the caller and
+// shared with the stop list below so both read off the same event timeline.
+function renderWaypointArrivals(legBounds, waypointPts, fuel, reserve) {
+  const rows = legBounds.slice(1).map((b, i) => {
+    const label = waypointPts[i + 1]?.label?.split(',')[0] || `waypoint ${i + 1}`;
+    const f = fuel[i];
+    const low = f.pct <= reserve * 100;
+    return `<li>
+      <div class="name"><span class="n">${i + 1}</span>${label}</div>
+      <div class="meta">arrive ~${fmtDuration(b.durationS)} driving (leg ${fmtDuration(b.durationS - legBounds[i].durationS)}) · tank ≈ ${f.gal.toFixed(1)} gal (${f.pct.toFixed(0)}%)</div>
+      ${low ? `<div class="warn">At or below your ${Math.round(reserve * 100)}% reserve on arrival.</div>` : ''}
+    </li>`;
+  }).join('');
+  $('wpInfo').innerHTML = `<div class="meta">Driving times are OSRM's free-flow routing estimate — no traffic, no stop time.</div>` + rows;
+}
+
+function render(stops, totalKm, route, finalLegDurationS, stopFuel, reserve) {
+  say(`${mi(totalKm)} mi, ~${(route.duration / 3600).toFixed(1)} h driving — ${stops.length} fuel stop${stops.length === 1 ? '' : 's'}.`);
+  stops.forEach((s, i) => {
+    L.marker([s.lat, s.lon]).addTo(drawn)
+      .bindPopup(`<b>${i + 1}. ${s.name}</b><br>mile ${mi(s.realKm)}`);
+    const f = stopFuel[i];
+    const low = f.pct <= reserve * 100;
+    $('stops').insertAdjacentHTML('beforeend', `<li>
+      <div class="name"><span class="n">${i + 1}</span>${s.name}</div>
+      <div class="meta">mile ${mi(s.realKm)} · ${mi(s.realLeg)} mi / ${fmtDuration(s.legDurationS)} since last fill · ${(s.detour * 1000 / KM_PER_MI / 1000).toFixed(1)} mi off route
+        · arrive with ≈ ${f.gal.toFixed(1)} gal (${f.pct.toFixed(0)}%)
+        ${s.open ? '· ' + s.open : ''}
+        <br><a href="https://www.google.com/maps/search/?api=1&query=${s.lat},${s.lon}" target="_blank" rel="noopener">open in maps</a></div>
+      ${low ? `<div class="warn">Arriving at or below your ${Math.round(reserve * 100)}% reserve.</div>` : ''}
+    </li>`);
+  });
+  if (stops.length) $('stops').insertAdjacentHTML('beforeend',
+    `<li><div class="meta">${mi(totalKm - stops[stops.length - 1].realKm)} mi / ${fmtDuration(finalLegDurationS)} to destination</div></li>`);
+}
+
+// Total fuel for the whole trip — same axis as effective mpg (adjTotalKm/kmPerGal ==
+// totalKm/effMpg, see the self-checks), so it can't silently disagree with the number already
+// shown above it. $/gal has no keyless, no-network source, so it's a plain user-editable input
+// (#price), not fetched or hardcoded data.
+function renderTripFuel(totalGal, fillUps) {
+  const price = +$('price').value || 0;
+  const cost = price > 0 ? ` · ≈ $${(totalGal * price).toFixed(2)} at $${price.toFixed(2)}/gal` : '';
+  $('econ').insertAdjacentHTML('beforeend',
+    `<div class="meta">Trip total ≈ ${totalGal.toFixed(1)} gal · ${fillUps} fill-up${fillUps === 1 ? '' : 's'}${cost}</div>`);
+}
+
+function tripName(trip) {
+  const a = trip.waypoints[0]?.label?.split(',')[0] || 'Start';
+  const b = trip.waypoints[trip.waypoints.length - 1]?.label?.split(',')[0] || 'Destination';
+  return `${a} to ${b} — Gas Plan`;
+}
+
+$('expGmaps').addEventListener('click', () => {
+  if (!currentTrip) { say('Plan a route first — nothing to export yet.', true); return; }
+  const legs = buildDirectionsUrls(exportSequence(currentTrip));
+  $('exportOut').innerHTML = legs.map(l => `<div><a href="${l.url}" target="_blank" rel="noopener">${l.label}</a></div>`).join('');
+});
+$('expKml').addEventListener('click', () => {
+  if (!currentTrip) { say('Plan a route first — nothing to export yet.', true); return; }
+  const seq = exportSequence(currentTrip).map(p => ({ ...p, desc: `mile ${mi(p.km)} · ${fmtDuration(p.durationS)} driving` }));
+  const routePts = currentTrip.route.geometry.coordinates.map(c => [c[1], c[0]]);
+  const blob = new Blob([buildKml(tripName(currentTrip), seq, routePts)], { type: 'application/vnd.google-earth.kml+xml' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'gasplan-route.kml';
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+  $('exportOut').textContent = 'KML downloaded — at mymaps.google.com click Create a new map, then Import, and choose the file.';
+});
+
+$('windBasis').addEventListener('change', () => {
+  const typical = $('windBasis').value === 'typical';
+  $('windDate').style.display = typical ? '' : 'none';
+  $('windNote').textContent = typical
+    ? `A ${WIND_HIST_YEARS}-year average for that date — a climatology, not a forecast for that specific day.`
+    : '';
+});
+
+$('go').addEventListener('click', run);
+$('panel').addEventListener('keydown', e => { if (e.key === 'Enter') run(); });
+
+// --- self check: ?test=1 ---------------------------------------------------
+
+if (new URLSearchParams(location.search).get('test')) {
+  const ok = (cond, msg) => { if (!cond) throw new Error('FAIL: ' + msg); console.log('ok -', msg); };
+
+  // Denver -> Chicago straight line is ~1470 km.
+  const d = haversine([39.74, -104.99], [41.88, -87.63]);
+  ok(Math.abs(d - 1470) < 20, `haversine Denver-Chicago = ${d.toFixed(0)} km`);
+
+  // A due-north line, 1 vertex per ~11.1 km.
+  const pts = Array.from({ length: 101 }, (_, i) => [40 + i * 0.1, -100]);
+  const cum = cumulate(pts);
+  ok(Math.abs(cum[100] - 1112) < 5, `cumulate 10 degrees latitude = ${cum[100].toFixed(0)} km`);
+  ok(Math.abs(pointAt(pts, cum, 556)[0] - 45) < 0.2, 'pointAt finds the midpoint'); // within one vertex
+
+  const stations = [
+    { name: 'near-far',  km: 480, detour: 3 },   // furthest, but a 3 km detour
+    { name: 'sweetspot', km: 470, detour: 0.2 }, // 10 km closer, basically on-route
+    { name: 'too-early', km: 100, detour: 0 },   // inside range but wastes most of a tank
+    { name: 'second',    km: 900, detour: 0 },   // out of reach until after the first fill
+  ];
+  const { stops, finalLeg } = planStops(stations, 1000, 500, 500);
+  ok(stops.length === 2, `two stops planned, got ${stops.length}`);
+  ok(stops[0].name === 'sweetspot', `detour penalty beat raw distance, picked ${stops[0].name}`);
+  ok(stops[0].leg === 470, `first leg = ${stops[0].leg} km`);
+  ok(stops[1].name === 'second' && finalLeg === 100, 'second stop chained off the first');
+
+  // Reviewer scenario: on a heavily-penalised stretch (factor near the CLIMB_FLOOR/
+  // SPEED_FACTOR_FLOOR of 0.4), scoring km (fuel-adjusted) against raw real-km detour
+  // inverts the pick above — near-far's bigger detour costs less in real km than it's
+  // worth in adjusted km. Scaling detour by the same local rate as km fixes it.
+  const factor = 0.42, rate = 1 / factor;
+  const econStations = stations.map(s => ({ ...s, km: s.km * rate, adjDetour: s.detour * rate }));
+  const econPlan = planStops(econStations, 1000 * rate, 500 * rate, 500 * rate).stops;
+  ok(econPlan[0].name === 'sweetspot',
+    `adjusted detour beat raw distance at a 0.42 local factor, picked ${econPlan[0].name}`);
+
+  // No station in reach -> report the gap instead of looping forever.
+  const dead = planStops([{ name: 'x', km: 10, detour: 0 }], 1000, 500, 500);
+  ok(dead.gap && dead.stops.length === 0, 'unreachable stretch reported as a gap');
+
+  ok(planStops(stations, 400, 500, 500).stops.length === 0, 'short trip needs no stop');
+
+  // Vehicle range: mpg x gallons, then the same reserve/start-fuel math run() applies.
+  const r = vehicleRange(25, 12);
+  ok(r === 300, `vehicleRange 25 mpg x 12 gal = ${r} mi`);
+  const legRange = r * (1 - 0.15); // 15% reserve
+  ok(Math.abs(legRange - 255) < 1e-9, `usable leg range at 15% reserve = ${legRange} mi`);
+  const firstLegRange = r * (0.9 - 0.15); // 90% start fuel, 15% reserve
+  ok(Math.abs(firstLegRange - 225) < 1e-9, `first-leg range at 90% start fuel = ${firstLegRange} mi`);
+
+  // Grade factor: climbing costs mpg, descending recovers less than the matching climb cost, floored sanely.
+  ok(Math.abs(gradeFactor(5) - 0.6) < 1e-9, `5% climb factor = ${gradeFactor(5)}`); // 1 - 0.08*5
+  ok(gradeFactor(50) === CLIMB_FLOOR, `absurd climb floors at ${CLIMB_FLOOR}`);
+  ok(Math.abs(gradeFactor(-5) - 1.1) < 1e-9, `5% descent factor = ${gradeFactor(-5)}`); // 1 + 0.02*5
+  ok((gradeFactor(-5) - 1) < (1 - gradeFactor(5)), 'descent credit is smaller than the matching climb penalty');
+
+  // Wind: pure headwind hurts, pure tailwind helps, crosswind is ~neutral.
+  const head = headwindMph(20, 0, 0);     // wind FROM due north, travelling north (into it) -> headwind
+  ok(Math.abs(head - 20) < 1e-9, `pure headwind component = ${head} mph`);
+  const tail = headwindMph(20, 0, 180);   // wind FROM due north, travelling south (with it) -> tailwind
+  ok(Math.abs(tail + 20) < 1e-9, `pure tailwind component = ${tail} mph`);
+  const cross = headwindMph(20, 0, 90);   // wind from due north, travelling east -> crosswind
+  ok(Math.abs(cross) < 1e-9, `pure crosswind component = ${cross} mph`);
+  ok(windFactor(head, 65) < 1, 'headwind lowers the wind factor (worse economy)');
+  ok(windFactor(tail, 65) > 1, 'tailwind raises the wind factor (better economy)');
+  ok(Math.abs(windFactor(cross, 65) - 1) < 1e-9, 'crosswind leaves the wind factor unchanged');
+
+  // Wind climatology: directions must vector-average, not plain-average — the mean of 350deg and
+  // 10deg is ~0deg/360deg, not the wrong 180deg a naive numeric average would give.
+  const avgNS = windVecMean([{ speed: 10, dir: 350 }, { speed: 10, dir: 10 }]);
+  ok(avgNS.dir < 5 || avgNS.dir > 355, `350deg/10deg average lands near 0/360, not 180: got ${avgNS.dir.toFixed(1)}`);
+  ok(Math.abs(avgNS.speed - 10) < 0.5, `350deg/10deg same-speed average keeps ~the same speed: ${avgNS.speed.toFixed(2)}`);
+
+  const opposed = windVecMean([{ speed: 15, dir: 0 }, { speed: 15, dir: 180 }]);
+  ok(opposed.speed < 1e-6, `opposing equal winds cancel to ~zero resultant magnitude: ${opposed.speed}`);
+
+  const sameObs = [{ speed: 12, dir: 200 }, { speed: 12, dir: 200 }, { speed: 12, dir: 200 }];
+  const sameAvg = windVecMean(sameObs);
+  ok(Math.abs(sameAvg.speed - 12) < 1e-6 && Math.abs(sameAvg.dir - 200) < 1e-6,
+    `identical observations return the same speed/direction unchanged: ${sameAvg.speed}mph @ ${sameAvg.dir}deg`);
+
+  const spread = [{ speed: 10, dir: 0 }, { speed: 10, dir: 90 }];
+  const vecSpread = windVecMean(spread);
+  const scalarMeanSpread = (10 + 10) / 2;
+  ok(vecSpread.speed <= scalarMeanSpread + 1e-9,
+    `vector-mean magnitude (${vecSpread.speed.toFixed(2)}) <= scalar-mean speed (${scalarMeanSpread})`);
+  ok(vecSpread.speed < scalarMeanSpread - 1, 'directions that actually differ pull the vector-mean measurably below the scalar mean');
+
+  // Speed: no penalty at/below baseline, DOE/fueleconomy.gov-midpoint 7% per 5 mph over.
+  ok(speedFactor(55) === 1, 'no penalty below the 60mph baseline');
+  ok(speedFactor(60) === 1, 'no penalty at the baseline');
+  ok(Math.abs(speedFactor(65) - 0.93) < 1e-9, `5 over = ${speedFactor(65)}`);
+  ok(Math.abs(speedFactor(70) - 0.86) < 1e-9, `10 over = ${speedFactor(70)}`);
+
+  // Fuel-adjusted axis: with every factor pinned to 1 (a 40mph step, under both the motorway
+  // calibration threshold and the speed baseline; no elevation/wind data), the axis must exactly
+  // reproduce the real one, and planStops on it must reproduce today's unadjusted plan exactly.
+  const flatSteps = [{ toKm: 1000, mph: 40 }];
+  const sampleKm2 = Array.from({ length: 11 }, (_, i) => i * 100);
+  const samplePts2 = sampleKm2.map(() => [40, -100]); // unused: winds is null, so bearing never runs
+  const axis = buildFuelAxis(sampleKm2, samplePts2, null, null, flatSteps, 0);
+  ok(axis.adjCum.every((v, i) => Math.abs(v - sampleKm2[i]) < 1e-9), 'zero-adjustment axis matches the real one exactly');
+  ok(Math.abs(axis.overallFactor - 1) < 1e-9, 'zero-adjustment overall factor = 1');
+  const toAdj2 = km => interpAxis(sampleKm2, axis.adjCum, km);
+  const mappedStations = stations.map(s => ({ ...s, km: toAdj2(s.km) }));
+  const basePlan = planStops(stations, 1000, 500, 500).stops;
+  const adjPlan = planStops(mappedStations, 1000, 500, 500).stops;
+  ok(JSON.stringify(adjPlan) === JSON.stringify(basePlan), 'fuel-adjusted plan matches the unadjusted plan when the axis is identity');
+
+  // Transient-failure retry predicate (shared by Overpass and Open-Meteo): opaque network
+  // failures (incl. CORS-blocked error responses, which look identical to a dead host from
+  // here) are retryable; a real 400 is not.
+  const opaqueErr = new Error('Could not reach overpass-api.de (Load failed)');
+  opaqueErr.opaque = true;
+  ok(transientRetryable(opaqueErr), 'opaque network failure ("Load failed") is retryable');
+  ok(transientRetryable(new Error('overpass-api.de returned 503 — rate limited, wait a moment and retry')),
+    'a real 503 status is retryable');
+  ok(!transientRetryable(new Error('overpass-api.de returned 400')), 'a 400 (malformed query) is not retryable');
+  // The actual message getJSON produces for a 429 (see getJSON) — the case that started this:
+  // Open-Meteo's rate limit must retry, not fall straight to the degradation path.
+  ok(transientRetryable(new Error('api.open-meteo.com returned 429 — rate limited, wait a moment and retry')),
+    'an Open-Meteo 429 is retryable — same predicate now covers both hosts');
+
+  // Cache key derivation (elevCache/histCache): coordinates that round to the same 4-decimal
+  // precision already sent to Open-Meteo share a cache entry (a "hit" — the point of caching a
+  // replanned route); coordinates a real rounding step apart do not (a "miss" — genuinely
+  // different points must not collide).
+  ok(coordKey([40.12341, -105.6789]) === coordKey([40.12344, -105.6789]),
+    `sub-rounding coordinate differences hit the same cache key: ${coordKey([40.12341, -105.6789])}`);
+  ok(coordKey([40.12341, -105.6789]) !== coordKey([40.12351, -105.6789]),
+    'coordinates a full 4dp rounding step apart miss the cache');
+  ok(coordKey([40.1234, -105.6789]) === '40.1234,-105.6789', `coordKey formats as "lat,lon" at 4dp: ${coordKey([40.1234, -105.6789])}`);
+
+  // Route labeling: distance-weighted refs, majors preferred over bare numbers, semicolon-joined
+  // refs keep only the first, internal spaces become hyphens.
+  const stepsMajor = [{ ref: 'I 70', distance: 500000 }, { ref: 'US 50', distance: 100000 }, { ref: '49', distance: 5000 }];
+  ok(labelRoute(stepsMajor) === 'via I-70 / US-50', `major refs win and sort by distance: ${labelRoute(stepsMajor)}`);
+  ok(labelRoute([{ ref: 'US 6; US 191', distance: 1000 }]) === 'via US-6', 'semicolon-joined ref keeps only the first');
+  ok(labelRoute([{ ref: '49', distance: 1000 }]) === 'via 49', 'bare ref kept when no major ref exists');
+  ok(labelRoute([{ ref: '49', distance: 1000 }, { ref: 'I 25', distance: 500 }]) === 'via I-25',
+    'bare county ref dropped once a real interstate is present');
+  ok(labelRoute([]) === 'via unnamed roads', 'no refs at all falls back to a plain label');
+
+  // Corridor de-dup: shared dominant refs AND a nearby midpoint = same corridor. The Lakewood ->
+  // Black Rock City case: I-25/I-80 (north) vs I-70/US-50 (west) are genuinely distinct.
+  const north1 = { refs: ['I-25', 'I-80'], mid: [41.1, -104.8] };
+  const north2 = { refs: ['I-25', 'I-80'], mid: [41.3, -104.5] }; // same corridor, nearby
+  const west   = { refs: ['I-70', 'US-50'], mid: [39.0, -114.0] };
+  const farNorth = { refs: ['I-25', 'I-80'], mid: [35.0, -104.8] }; // same refs, far away — not a dup
+  ok(isDuplicateCorridor(north1, north2), 'same dominant refs + close midpoint = duplicate');
+  ok(!isDuplicateCorridor(north1, west), 'I-25/I-80 vs I-70/US-50 is not a duplicate');
+  ok(!isDuplicateCorridor(north1, farNorth), 'same refs but far-apart midpoints is not a duplicate');
+
+  // Perpendicular offset: lands ~OFFSET_KM from the a->b line, roughly 90 degrees off its bearing.
+  const oa = [39.7, -105.0], ob = [40.9, -114.9]; // Lakewood-ish -> Reno-ish
+  const base = [(oa[0] + ob[0]) / 2, (oa[1] + ob[1]) / 2];
+  const off = perpOffsetPoint(oa, ob, 0.5, 200, 1);
+  const offDist = haversine(base, off);
+  ok(Math.abs(offDist - 200) < 5, `perpOffsetPoint lands ~200km from the baseline point, got ${offDist.toFixed(1)}`);
+  const diff = ((bearing(base, off) - bearing(oa, ob) + 540) % 360) - 180;
+  ok(Math.abs(Math.abs(diff) - 90) < 2, `offset direction is ~perpendicular to the route bearing, diff=${diff.toFixed(1)}`);
+  const offOtherSide = perpOffsetPoint(oa, ob, 0.5, 200, -1);
+  ok(haversine(off, offOtherSide) > 300, 'opposite side lands on the other side of the line');
+
+  // Multi-waypoint corridor discovery (longestLegIndex/insertAnchor): the reported trip,
+  // Lakewood CO -> Fernley NV -> Black Rock City NV. The long leg (Lakewood->Fernley, ~1500km)
+  // is where I-70/I-80 actually diverge; the short leg (Fernley->Black Rock City, ~135km) is
+  // essentially one road, so the anchor must land on the first leg, not the second.
+  const lakewood = { lat: 39.7086, lon: -105.0847 }, fernley = { lat: 39.6079, lon: -119.2506 },
+        brc = { lat: 40.7895, lon: -119.2077 };
+  const tripPts = [lakewood, fernley, brc];
+  const legI = longestLegIndex(tripPts);
+  ok(legI === 0, `longest leg is Lakewood->Fernley (index 0), got ${legI}`);
+  const withAnchor = insertAnchor(tripPts, legI, { lat: 41, lon: -112 });
+  ok(withAnchor.length === tripPts.length + 1, `insertAnchor adds exactly one point: ${withAnchor.length}`);
+  ok(withAnchor[0] === lakewood && withAnchor[2] === fernley && withAnchor[3] === brc,
+    'every user waypoint stays present and in order, anchor spliced into the chosen leg only');
+  ok(withAnchor[1].lat === 41 && withAnchor[1].lon === -112, 'anchor lands at the requested point');
+  // A trip where the *last* leg is longest must still be found, not just index 0 by default.
+  ok(longestLegIndex([lakewood, { lat: 39.75, lon: -105.3 }, brc]) === 1,
+    `longest leg can be the last leg too, got ${longestLegIndex([lakewood, { lat: 39.75, lon: -105.3 }, brc])}`);
+  // Any insertion point (not just legIdx 0) preserves waypoint order and count.
+  ok(insertAnchor(tripPts, 1, { lat: 40, lon: -119 }).length === 4 &&
+    JSON.stringify(insertAnchor(tripPts, 1, { lat: 40, lon: -119 }).filter(p => tripPts.includes(p))) === JSON.stringify(tripPts),
+    'insertAnchor at any legIdx keeps every user waypoint, in order');
+
+  // Tank-size estimate: EPA VClass -> gallons, verified against real values pulled from the API
+  // (curl, 2026-08-05) for a compact car, a small SUV, and a standard pickup.
+  ok(tankFromVClass('Compact Cars') === 13, `compact car tank estimate = ${tankFromVClass('Compact Cars')}`);
+  ok(tankFromVClass('Small Sport Utility Vehicle 2WD') === 16,
+    `small SUV tank estimate = ${tankFromVClass('Small Sport Utility Vehicle 2WD')}`);
+  ok(tankFromVClass('Standard Pickup Trucks 2WD') === 26,
+    `standard pickup tank estimate = ${tankFromVClass('Standard Pickup Trucks 2WD')}`);
+  ok(tankFromVClass('nonsense class') === DEFAULT_TANK_GAL, 'unrecognised VClass falls back to the default');
+
+  // Duration formatter: minutes only, hours+minutes, and multi-day.
+  ok(fmtDuration(90) === '2m', `90s = ${fmtDuration(90)}`);
+  ok(fmtDuration(5400) === '1h 30m', `5400s = ${fmtDuration(5400)}`);
+  ok(fmtDuration(90000) === '1d 1h 0m', `90000s = ${fmtDuration(90000)}`);
+
+  // Tank level at each waypoint, on the fuel-adjusted axis (identity toAdj here, so real km ==
+  // adjusted km — the axis math itself is covered by the buildFuelAxis checks above).
+  const idAdj = km => km;
+  // 10 gal tank, 25 (adjusted) km/gal, full start, one waypoint at km 100, no stop: 100/25 = 4 gal burned.
+  const noStop = fuelAtWaypoints([{ distKm: 0 }, { distKm: 100 }], [], idAdj, 25, 10, 1);
+  ok(Math.abs(noStop.waypoints[0].gal - 6) < 1e-9, `burn on the adjusted axis: 10gal - 100km/25 = ${noStop.waypoints[0].gal} gal left`);
+  ok(Math.abs(noStop.waypoints[0].pct - 60) < 1e-9, `= ${noStop.waypoints[0].pct}% of tank`);
+  // Same trip, but a planned stop at km 80 refills to full before the km-100 waypoint.
+  const withStop = fuelAtWaypoints([{ distKm: 0 }, { distKm: 100 }], [{ km: 80 }], idAdj, 25, 10, 1);
+  ok(Math.abs(withStop.waypoints[0].gal - 9.2) < 1e-9,
+    `refill at the stop: full at km80, then (100-80)/25 burned = ${withStop.waypoints[0].gal} gal left`);
+  // 10 gal tank, 10 km/gal, no stop, waypoint at km 95, 15% reserve -> 0.5 gal (5%) left, below reserve.
+  const lowFuel = fuelAtWaypoints([{ distKm: 0 }, { distKm: 95 }], [], idAdj, 10, 10, 1);
+  ok(Math.abs(lowFuel.waypoints[0].pct - 5) < 1e-9, `near-empty arrival = ${lowFuel.waypoints[0].pct}%`);
+  ok(lowFuel.waypoints[0].pct <= 15, 'that arrival is at/below a 15% reserve — the case the user wants flagged');
+
+  // Feature 1: fuelAtWaypoints generalised to also report arrival fuel — before refilling — at
+  // planned stops, off the same event timeline as waypoints. A stop reached via more adjusted km
+  // (worse economy, e.g. a climb) must show less fuel than the same real distance on a flat, calm,
+  // at-limit axis — built with the real buildFuelAxis a route actually uses, not a re-derivation.
+  const flatKm = [0, 100], flatPts = [[40, -105], [40.9, -105]];
+  const flatAxis2 = buildFuelAxis(flatKm, flatPts, [1000, 1000], null, [], 0);   // no grade -> factor 1
+  const climbAxis2 = buildFuelAxis(flatKm, flatPts, [1000, 2000], null, [], 0);  // 1000m climb over 100km
+  const toAdjFlat = km => interpAxis(flatKm, flatAxis2.adjCum, km);
+  const toAdjClimb = km => interpAxis(flatKm, climbAxis2.adjCum, km);
+  // A real planned stop's .km is already on its own route's adjusted axis (see planCandidate) —
+  // both stops sit at the same real 100km position, mapped through their own axis.
+  const flatStop = fuelAtWaypoints([], [{ km: toAdjFlat(100) }], toAdjFlat, 20, 10, 1);
+  const climbStop = fuelAtWaypoints([], [{ km: toAdjClimb(100) }], toAdjClimb, 20, 10, 1);
+  ok(climbStop.stops[0].gal < flatStop.stops[0].gal,
+    `same real 100km burns more on a climb than on flat: flat ${flatStop.stops[0].gal.toFixed(2)} gal vs climb ${climbStop.stops[0].gal.toFixed(2)} gal`);
+
+  // A stop arriving at/below reserve must be flagged the same way a low waypoint arrival already is.
+  const nearEmptyStop = fuelAtWaypoints([], [{ km: 95 }], idAdj, 10, 10, 1);
+  ok(nearEmptyStop.stops[0].pct <= 15, `near-empty stop arrival (${nearEmptyStop.stops[0].pct}%) flags at/below a 15% reserve`);
+
+  // Route-label collision fix: the reported Lakewood CO -> Black Rock City NV case, reproduced
+  // with the real refs/distances from a live OSRM run (see report) — options 2 and 3 both
+  // labelled "via I-80 / I-25" because I-80 (the shared trunk) and I-25 dominate both routes'
+  // top-2 by distance; they actually diverge on US-191, which only shows up further down the list.
+  const trunk = { route: { distance: 1549600, legs: [{ steps: [
+    { ref: 'I 80', distance: 565000 }, { ref: 'I 70', distance: 540000 }, { ref: 'US 6', distance: 213000 },
+  ] }] } };
+  const viaI25 = { route: { distance: 1559100, legs: [{ steps: [
+    { ref: 'I 80', distance: 1189000 }, { ref: 'I 25', distance: 115000 }, { ref: 'US 287', distance: 75000 },
+  ] }] } };
+  const viaI25longer = { route: { distance: 1626100, legs: [{ steps: [
+    { ref: 'I 80', distance: 1188000 }, { ref: 'I 25', distance: 115000 }, { ref: 'US 287', distance: 75000 },
+    { ref: 'US 191', distance: 61000 },
+  ] }] } };
+  const before = [trunk, viaI25, viaI25longer].map(c => labelRoute(routeSteps(c.route)));
+  ok(before[1] === before[2], `reproduces the reported collision before the fix: "${before[1]}" === "${before[2]}"`);
+  const fixed = labelCandidates([trunk, viaI25, viaI25longer]);
+  ok(new Set(fixed).size === 3, `no two labels collide: ${JSON.stringify(fixed)}`);
+  ok(fixed[1] !== fixed[2], `the reported I-80/I-25 collision does not recur: "${fixed[1]}" vs "${fixed[2]}"`);
+  ok(fixed[2].includes('US-191'), `divergent option is labelled by the road that sets it apart: ${fixed[2]}`);
+  // Two candidates with literally identical refs (nothing to diverge on) still get distinct
+  // labels — fall back to distance so the "no two share a label" invariant holds unconditionally.
+  const twinA = { route: { distance: 800000, legs: [{ steps: [{ ref: 'I 90', distance: 800000 }] }] } };
+  const twinB = { route: { distance: 810000, legs: [{ steps: [{ ref: 'I 90', distance: 810000 }] }] } };
+  const twinLabels = labelCandidates([twinA, twinB]);
+  ok(twinLabels[0] !== twinLabels[1], `identical-ref fallback still distinguishes: ${JSON.stringify(twinLabels)}`);
+
+  // Export: Google Maps URL splitting at the real, documented waypoint limit (3, the mobile-
+  // browser number — see GMAPS_MAX_WAYPOINTS). 10 points (5 user waypoints + 5 fuel stops, the
+  // reported trip's shape) must split into consecutive legs, each within the limit, each leg's
+  // end shared with the next leg's start so nothing is dropped or gapped.
+  const tenPts = Array.from({ length: 10 }, (_, i) => ({ lat: 40 + i, lon: -100 + i, name: `p${i}` }));
+  const legs10 = splitLegs(tenPts, GMAPS_MAX_WAYPOINTS);
+  ok(legs10.length === 3, `10 points at a 3-waypoint limit split into 3 legs, got ${legs10.length}`);
+  ok(legs10.every(l => l.length - 2 <= GMAPS_MAX_WAYPOINTS), 'every leg stays within the waypoint limit');
+  ok(legs10.every((l, i) => i === 0 || l[0] === legs10[i - 1][legs10[i - 1].length - 1]),
+    'consecutive legs share their boundary point — no gap');
+  ok(legs10[0][0] === tenPts[0] && legs10[legs10.length - 1][legs10[legs10.length - 1].length - 1] === tenPts[9],
+    'full sequence start-to-end is covered');
+  // Under the limit: no split, one leg, all points present.
+  const fourPts = tenPts.slice(0, 4); // 4 points = 2 via, under the limit of 3
+  ok(splitLegs(fourPts, GMAPS_MAX_WAYPOINTS).length === 1, 'a trip under the limit is not split');
+
+  // gmapsDirUrl: origin/destination always present; waypoints param only when there are vias,
+  // joined with |, no waypoints key at all for a plain 2-point leg.
+  const url2 = gmapsDirUrl([{ lat: 1, lon: 2 }, { lat: 3, lon: 4 }]);
+  ok(url2.includes('origin=1%2C2') && url2.includes('destination=3%2C4'), `2-point URL has origin/destination: ${url2}`);
+  ok(!url2.includes('waypoints='), 'no waypoints param when there are no via points');
+  const url3 = gmapsDirUrl([{ lat: 1, lon: 2 }, { lat: 5, lon: 6 }, { lat: 3, lon: 4 }]);
+  ok(url3.includes('waypoints=5%2C6'), `via point lands in the waypoints param: ${url3}`);
+  const labelled = buildDirectionsUrls(tenPts);
+  ok(labelled.length === 3 && labelled.every(l => l.url.startsWith('https://www.google.com/maps/dir/?')),
+    'buildDirectionsUrls produces one labelled Google Maps URL per leg');
+  ok(labelled[0].label.includes('p0') && labelled[0].label.includes('Leg 1/3'), `multi-leg labels identify which leg: ${labelled[0].label}`);
+  ok(buildDirectionsUrls(fourPts)[0].label === 'Directions', 'a single-leg export gets a plain label, not "Leg 1/1"');
+
+  // XML escaping: a station name with all four special characters plus a non-ASCII one (as real
+  // OpenStreetMap names do) must have the XML metacharacters escaped and the non-ASCII character
+  // passed through untouched (valid as UTF-8 XML content, doesn't need escaping).
+  const dirty = `Tesoro & Sons "Fuel" <Café>`;
+  const esc = escapeXml(dirty);
+  ok(esc === 'Tesoro &amp; Sons &quot;Fuel&quot; &lt;Café&gt;', `escapeXml output: ${esc}`);
+  ok(!esc.includes('<Café') && !esc.includes('"Fuel"'), 'raw XML metacharacters are gone from the escaped output');
+  ok(esc.includes('é'), 'non-ASCII passes through unescaped');
+  const kml = buildKml('Test Trip', [{ lat: 1, lon: 2, name: dirty, desc: 'mile 5 · 1h 0m driving' }], null);
+  ok(kml.includes('<name>Tesoro &amp; Sons &quot;Fuel&quot; &lt;Café&gt;</name>'), 'buildKml escapes a placemark name');
+  ok(!kml.includes('<Café>'), 'buildKml never emits an unescaped tag-like fragment from user data');
+
+  // exportSequence: user waypoints (from legBounds) and fuel stops (real km + cumulative
+  // .legDurationS) merge into one route-ordered list.
+  const fakeTrip = {
+    waypoints: [{ lat: 40, lon: -105, label: 'Lakewood, CO, USA' }, { lat: 41, lon: -111, label: 'Salt Lake City, UT, USA' }],
+    legBounds: [{ distKm: 0, durationS: 0 }, { distKm: 900, durationS: 32000 }],
+    stops: [{ lat: 40.5, lon: -108, name: 'Mid Fuel', realKm: 450, legDurationS: 16000 }],
+  };
+  const seq = exportSequence(fakeTrip);
+  ok(seq.length === 3, `exportSequence merges waypoints and stops: ${seq.length} points`);
+  ok(seq[0].name === 'Lakewood' && seq[1].name === 'Mid Fuel' && seq[2].name === 'Salt Lake City',
+    `route order by km: ${seq.map(p => p.name).join(' -> ')}`);
+  ok(seq[1].durationS === 16000, `stop duration is cumulative from start: ${seq[1].durationS}`);
+
+  // Per-segment factor attribution: a sample interval with known grade, wind, and speed yields
+  // the three independent factors buildFuelAxis already computes for the trip total, now exposed
+  // per segment (see segments) for the "where on the route" display.
+  const segSteps = [{ toKm: 200, mph: 40 }]; // below MOTORWAY_MPH_THRESHOLD, so no motorway bump
+  const segKm = [0, 100, 200];
+  const segPts = [[40, -105], [40.9, -105], [41.8, -105]]; // due north, ~100km apart
+  const segElev = [1000, 1500, 1500]; // 500m climb over 100km, then flat
+  const segWinds = [{ speed: 20, dir: 0 }, { speed: 20, dir: 0 }, { speed: 20, dir: 0 }]; // wind FROM due north
+  const segAxis = buildFuelAxis(segKm, segPts, segElev, segWinds, segSteps, 25); // +25 over -> 65mph actual
+  ok(segAxis.segments.length === 2, `two segments from three sample points, got ${segAxis.segments.length}`);
+  const seg0 = segAxis.segments[0];
+  ok(Math.abs(seg0.terrain - gradeFactor(0.5)) < 1e-9, `segment terrain factor matches gradeFactor(0.5): ${seg0.terrain}`);
+  const segHeadwind = headwindMph(20, 0, bearing(segPts[0], segPts[1]));
+  ok(Math.abs(seg0.wind - windFactor(segHeadwind, 65)) < 1e-9, `segment wind factor matches windFactor: ${seg0.wind}`);
+  ok(Math.abs(seg0.speed - speedFactor(65)) < 1e-9, `segment speed factor matches speedFactor(65): ${seg0.speed}`);
+  ok(Math.abs(seg0.factor - seg0.terrain * seg0.wind * seg0.speed) < 1e-9, 'combined segment factor is the product of the three');
+
+  // Feature 2: total trip fuel. Two equivalent formulas — adjusted-distance/base-rate and
+  // real-distance/effective-rate (effective = base * overallFactor, exactly how renderEconomy
+  // derives effective mpg from baseMpg) — must agree, and the total must equal the sum of each
+  // segment's own adjusted-km burn, not drift from what the per-segment panel computes separately.
+  // (Expressed in km/gal, not mi/gal: KM_PER_MI lives above this test harness's sliced "logic"
+  // region and isn't in scope here — the unit doesn't matter to the identity being checked.)
+  const totalKmSeg = segKm[segKm.length - 1];
+  const adjTotalKmSeg = segAxis.adjCum[segAxis.adjCum.length - 1];
+  const kmPerGalSeg = 20; // nominal-condition km/gal, arbitrary but fixed
+  const totalGalA = adjTotalKmSeg / kmPerGalSeg;
+  const effKmPerGalSeg = kmPerGalSeg * segAxis.overallFactor;
+  const totalGalB = totalKmSeg / effKmPerGalSeg;
+  ok(Math.abs(totalGalA - totalGalB) < 1e-9,
+    `total fuel agrees both ways: adjKm/baseRate=${totalGalA.toFixed(6)} vs realKm/effRate=${totalGalB.toFixed(6)}`);
+  const legBurnSum = segAxis.segments.reduce((a, s) => a + s.realKm / s.factor, 0);
+  ok(Math.abs(legBurnSum / kmPerGalSeg - totalGalA) < 1e-9,
+    'total fuel equals the sum of the per-leg (per-segment) burns');
+
+  // Colour scale: neutral (factor 1) is distinct from a segment well above or below it, and
+  // out-of-range values clamp to the endpoint colour rather than extrapolating into garbage.
+  const cNeutral = factorColor(1), cGood = factorColor(FACTOR_SCALE_HI), cBad = factorColor(FACTOR_SCALE_LO);
+  ok(cNeutral !== cGood && cNeutral !== cBad && cGood !== cBad, 'neutral/better/worse map to distinct colours');
+  ok(factorColor(FACTOR_SCALE_HI + 5) === factorColor(FACTOR_SCALE_HI), 'above-range factor clamps to the best colour');
+  ok(factorColor(FACTOR_SCALE_LO - 5) === factorColor(FACTOR_SCALE_LO), 'below-range factor clamps to the worst colour');
+  ok(/^rgb\(\d+,\d+,\d+\)$/.test(factorColor(0)), 'colour scale always returns a defined rgb() string, even for wild input');
+
+  // Segment aggregation: bucketing must reproduce the same weighted-cost math as the trip total.
+  const rawSegs = [
+    { fromKm: 0, toKm: 10, realKm: 10, terrain: 1, wind: 1, speed: 1, factor: 1 },
+    { fromKm: 10, toKm: 20, realKm: 10, terrain: 0.5, wind: 1, speed: 1, factor: 0.5 },
+  ];
+  const buckets = aggregateSegments(rawSegs, 1); // force both raw segments into one bucket
+  ok(buckets.length === 1, `targetRows=1 merges everything into one bucket, got ${buckets.length}`);
+  ok(Math.abs(buckets[0].terrainPct - 50) < 1e-9, `merged terrain pct = weighted cost, not a plain average: ${buckets[0].terrainPct}`);
+  ok(Math.abs(buckets[0].factor - 2 / 3) < 1e-9, `merged factor = total real km / total adjusted km: ${buckets[0].factor}`);
+
+  // pointsFromSteps: flattens every step's geometry, [lon,lat] GeoJSON -> [lat,lon] app convention.
+  // Free even for a discovery-time (overview=false) route — see the function's own comment.
+  const fakeStepRoute = { legs: [{ steps: [
+    { geometry: { coordinates: [[-105, 40], [-105, 40.5]] } },
+    { geometry: { coordinates: [[-105, 40.5], [-105, 41]] } },
+  ] }] };
+  const stepPts = pointsFromSteps(fakeStepRoute);
+  ok(stepPts.length === 4, `pointsFromSteps flattens every step's coordinates: ${stepPts.length}`);
+  ok(stepPts[0][0] === 40 && stepPts[0][1] === -105, `coordinates swapped to [lat, lon]: ${stepPts[0]}`);
+  ok(pointsFromSteps({ legs: [] }) === null, 'a route with no step geometry at all returns null, not an empty crash');
+
+  // Waypoint reordering: move up and down, verify boundaries and no-ops.
+  const wp = ['Denver', 'Chicago', 'Boston'];
+  const wpUp = moveWaypoint(wp, 2, 1);
+  ok(JSON.stringify(wpUp) === JSON.stringify(['Denver', 'Boston', 'Chicago']),
+    `moveWaypoint(list, 2, 1) moves last up: ${JSON.stringify(wpUp)}`);
+  const wpDn = moveWaypoint(wp, 0, 1);
+  ok(JSON.stringify(wpDn) === JSON.stringify(['Chicago', 'Denver', 'Boston']),
+    `moveWaypoint(list, 0, 1) moves first down: ${JSON.stringify(wpDn)}`);
+  const wpNoOp = moveWaypoint(wp, 1, 1);
+  ok(JSON.stringify(wpNoOp) === JSON.stringify(wp), 'moveWaypoint(list, i, i) is identity');
+  ok(moveWaypoint(wp, 1, 0).length === wp.length, 'moveWaypoint preserves array length');
+  ok(moveWaypoint(wp, 1, 0).every(x => wp.includes(x)), 'moveWaypoint preserves all entries');
+
+  // Waypoint insertion: at start, middle, and end.
+  const wpIns0 = insertWaypoint(wp, 0);
+  ok(wpIns0.length === 4 && wpIns0[0] === '' && wpIns0[1] === 'Denver',
+    `insertWaypoint(list, 0) inserts at start: ${JSON.stringify(wpIns0)}`);
+  const wpIns1 = insertWaypoint(wp, 1);
+  ok(wpIns1.length === 4 && wpIns1[1] === '' && wpIns1[2] === 'Chicago',
+    `insertWaypoint(list, 1) inserts at position 1: ${JSON.stringify(wpIns1)}`);
+  const wpIns3 = insertWaypoint(wp, 3);
+  ok(wpIns3.length === 4 && wpIns3[3] === '' && wpIns3[2] === 'Boston',
+    `insertWaypoint(list, 3) inserts at end: ${JSON.stringify(wpIns3)}`);
+  ok(insertWaypoint(wp, 1).length === wp.length + 1, 'insertWaypoint increases length by exactly 1');
+
+  // Verify both operations maintain minimum 2-waypoint invariant: can move/insert in a 2-element list.
+  const wp2 = ['A', 'B'];
+  ok(moveWaypoint(wp2, 0, 1).length === 2, 'moveWaypoint on 2-element list returns 2 elements');
+  ok(insertWaypoint(wp2, 1).length === 3, 'insertWaypoint on 2-element list returns 3 elements (insertion allowed, removal blocked)');
+
+  console.log('%call self checks passed', 'color:green;font-weight:bold');
+  say('Self checks passed — see console.');
+}
+</script>
+</body>
+</html>
