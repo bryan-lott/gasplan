@@ -40,7 +40,7 @@ Gasplan uses the following free, keyless public APIs:
 Please note the following limitations when using Gasplan for trip planning:
 
 - **Fuel prices**: Gas prices are not fetched from any real-time source. You provide a per-gallon price as an input, which defaults to a placeholder value. Update this figure before relying on cost estimates.
-- **Tank capacity**: Tank capacity is not available from any keyless API. Gasplan estimates tank size based on the EPA vehicle class, but you can override this figure manually if your vehicle's actual tank differs.
+- **Tank capacity**: No keyless API publishes a vehicle's fuel tank capacity — EPA's fueleconomy.gov has no tank field at all, and NHTSA's vehicle database has no fuel data either. Gasplan fills in a rough estimate based on the EPA vehicle class as a starting point, not a manufacturer figure, and the app labels it as such directly on the form. Always check your owner's manual or fuel door and enter your vehicle's actual tank size before relying on the plan.
 - **Speed limits**: Posted speed limits are not consistently available in OpenStreetMap data. Gasplan infers highway speeds from OSRM's step speeds and applies a fixed bump for motorway-class segments. This is a heuristic approximation, not a precise measurement.
 - **Fuel-economy coefficients**: Of the coefficients used to model fuel economy:
   - The speed penalty is drawn from published US Department of Energy figures.

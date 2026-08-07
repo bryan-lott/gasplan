@@ -61,7 +61,7 @@
     <div><label for="mpg">Highway mpg</label><input id="mpg" type="number" value="24"></div>
     <div><label for="gal">Tank (gal)</label><input id="gal" type="number" value="15"></div>
   </div>
-  <div id="tankNote" class="meta"></div>
+  <div id="tankNote" class="warn">Not from any vehicle API — this is a generic default. Check your manual or fuel door and correct this number.</div>
   <div id="rangeInfo" class="meta"></div>
   <div class="row">
     <div><label for="fuel">Start fuel %</label><input id="fuel" type="number" value="100"></div>
@@ -99,6 +99,12 @@ const KM_PER_MI = 1.609344;
 const DETOUR_WEIGHT = 8;     // 1 km of detour must buy 8 km of progress to be worth it
 const SEARCH_RADIUS_M = 3000;
 const SEARCH_STEP_KM = 5;    // < 2 x radius, so the search circles leave no gap along the route
+const DEFAULT_REFUEL_RADIUS_MI = 10; // sensible default search radius for a forced ("refuel
+                                      // here") waypoint stop — wide enough to usually find
+                                      // something near a small town, narrow enough to stay "near"
+const FORCED_DEDUPE_KM = 1.6;  // ~1 mi — collapse forced stops (or drop a general-search
+                                // station) landing this close to another forced stop, so a
+                                // real-world coincidence doesn't emit two stops a mile apart
 // maps.mail.ru first: verified in a real browser from a file:// page, 2026-08-05 (3 runs) —
 // 200 in 6-8s twice, one 504 in 35.5s (a real server response, not a CORS block or client abort),
 // all with the null origin accepted. overpass-api.de sends no Access-Control-Allow-Origin for a
@@ -889,10 +895,10 @@ async function postOverpass(query) {
     `(${last.message}). Wait a minute and try again.`);
 }
 
-async function overpassFuel(centres) {
+async function overpassFuel(centres, radiusM = SEARCH_RADIUS_M) {
   const around = centres.map(p => `${p[0].toFixed(5)},${p[1].toFixed(5)}`).join(',');
   const j = await postOverpass(
-    `[out:json][timeout:60];nwr(around:${SEARCH_RADIUS_M},${around})[amenity=fuel];out center 300;`);
+    `[out:json][timeout:60];nwr(around:${radiusM},${around})[amenity=fuel];out center 300;`);
   return j.elements.map(el => {
     const lat = el.lat ?? el.center?.lat, lon = el.lon ?? el.center?.lon;
     if (lat == null) return null;
@@ -900,6 +906,20 @@ async function overpassFuel(centres) {
     return { lat, lon, name: t.name || t.brand || t.operator || 'Unnamed fuel station',
              brand: t.brand || '', open: t['opening_hours'] || '' };
   }).filter(Boolean);
+}
+
+// A forced ("refuel here") waypoint's station search: a direct-radius query centred on the
+// waypoint itself, reusing overpassFuel's own amenity=fuel query rather than a second query
+// path — just a different centre/radius than the on-route sliding window fetchStations runs.
+// Picks the nearest station to the waypoint, not the detour-vs-position score planStops uses:
+// there's no "further along route is better" concept for a single anchor point, and nearest
+// minimises the detour from the actual place the user named. No candidates within radius ->
+// null, which the caller turns into a visible warning rather than a silent fallback.
+async function findForcedStation(wp) {
+  const centre = [wp.lat, wp.lon];
+  const found = await overpassFuel([centre], wp.radiusMi * KM_PER_MI * 1000);
+  if (!found.length) return null;
+  return found.reduce((a, b) => haversine(centre, [b.lat, b.lon]) < haversine(centre, [a.lat, a.lon]) ? b : a);
 }
 
 // One query per stretch where a stop could land, run one at a time. A single query
@@ -938,6 +958,47 @@ function planStops(stations, totalKm, firstLegKm, legKm) {
     reach = legKm;
   }
   return { stops, finalLeg: totalKm - position };
+}
+
+// Forced ("refuel here") stops split the route into independent planning problems — this runs
+// the existing planStops on each resulting sub-leg (in local, sub-leg-relative km) and stitches
+// the results back onto the whole route's fuel-adjusted axis, with each forced stop spliced in
+// at its own sub-leg boundary. planStops itself is untouched: only how many times it runs, and
+// over what stretch, changes. Every sub-leg after the first starts full (legKm range) — the
+// same "full tank at every planned stop" assumption fuelAtWaypoints already reasons about,
+// true here because a forced stop is, definitionally, a fill-up the user is committing to.
+// Generalises to N forced stops for free: bounds is just [0, ...forced.map(km), totalKm].
+function planStopsPartitioned(stations, forced, totalKm, firstLegKm, legKm) {
+  const bounds = [0, ...forced.map(f => f.km), totalKm];
+  const stops = [];
+  for (let i = 0; i < bounds.length - 1; i++) {
+    const segStart = bounds[i], segEnd = bounds[i + 1];
+    const segStations = stations.filter(s => s.km > segStart && s.km <= segEnd)
+      .map(s => ({ ...s, km: s.km - segStart }));
+    const seg = planStops(segStations, segEnd - segStart, i === 0 ? firstLegKm : legKm, legKm);
+    stops.push(...seg.stops.map(s => ({ ...s, km: s.km + segStart })));
+    // A gap partway through a sub-leg is reported exactly like an unpartitioned gap would be —
+    // offset back onto the whole route's axis, not left in sub-leg-local coordinates — and
+    // (matching planStops' own contract) nothing past it is planned.
+    if (seg.gap) return { stops, gap: [seg.gap[0] + segStart, seg.gap[1] + segStart] };
+    if (i < forced.length) stops.push(forced[i]);
+    else return { stops, finalLeg: seg.finalLeg };
+  }
+}
+
+// Two forced stops (different waypoints) whose best real station lands within FORCED_DEDUPE_KM
+// of each other collapse to one — keep the earlier along the route rather than emit two stops
+// a mile apart for what is, on the ground, the same fill-up.
+function dedupeForced(sorted) {
+  return sorted.filter((s, i) => i === 0 || s.realKm - sorted[i - 1].realKm > FORCED_DEDUPE_KM);
+}
+
+// A station the general on-route sweep found essentially on top of a forced stop — e.g. it's
+// the very same station, or one the optimizer would've picked right next to it anyway — must
+// not also survive as a second, separate stop a mile away. Drop anything within FORCED_DEDUPE_KM
+// of any forced stop before handing the pool to planStopsPartitioned.
+function dropNearForced(stations, forcedStops) {
+  return stations.filter(s => forcedStops.every(f => Math.abs(s.realKm - f.realKm) > FORCED_DEDUPE_KM));
 }
 
 // Samples the route, fetches terrain/wind, and turns them into a fuel-adjusted distance axis.
@@ -1053,9 +1114,9 @@ function moveWaypoint(list, from, to) {
   return newList;
 }
 
-function insertWaypoint(list, index) {
+function insertWaypoint(list, index, item = '') {
   const newList = [...list];
-  newList.splice(index, 0, '');
+  newList.splice(index, 0, item);
   return newList;
 }
 
@@ -1077,23 +1138,62 @@ function say(msg, isError) { $('status').textContent = msg; $('status').classNam
 // trip survives reload. Plain text inputs, no drag-and-drop — reorder by editing the text.
 
 const WPKEY = 'gasplan.waypoints';
-let waypoints = ['Denver, CO', 'Chicago, IL'];
+
+// A waypoint is its text plus an optional forced fuel stop: refuel (off by default) and the
+// search radius (miles) to use when it's on. Attached to the waypoint, not a parallel list, so
+// reorder/insert (moveWaypoint/insertWaypoint below — already pure array ops) carry it for free.
+function mkWaypoint(text) { return { text, refuel: false, radiusMi: DEFAULT_REFUEL_RADIUS_MI }; }
+// A negative/zero/non-numeric radius (typed directly — nothing calls checkValidity() on the
+// HTML min="1") would otherwise reach Overpass as a negative `around:` radius. Shared by
+// normalizeWaypoint (loading a save) and the wp-radius input handler (typing) — the two places
+// a radiusMi value enters the app.
+function clampRadius(v) { return Math.max(1, +v || DEFAULT_REFUEL_RADIUS_MI); }
+// Old saves were a bare string per waypoint; a newer save might still be missing refuel/radiusMi
+// if it predates this feature, or (corrupt localStorage) not even an object. Either way, missing
+// or malformed always means "off", never a crash on load.
+function normalizeWaypoint(w) {
+  return typeof w === 'string' ? mkWaypoint(w)
+    : w && typeof w === 'object' ? { text: w.text || '', refuel: !!w.refuel, radiusMi: clampRadius(w.radiusMi) }
+    : mkWaypoint('');
+}
+
+let waypoints = [mkWaypoint('Denver, CO'), mkWaypoint('Chicago, IL')];
 
 function renderWaypoints() {
-  $('waypoints').innerHTML = waypoints.map((v, i) => {
+  $('waypoints').innerHTML = waypoints.map((w, i) => {
     const btns = `
       <button type="button" class="up" data-i="${i}" title="move up" ${i === 0 ? 'disabled' : ''}>▲</button>
       <button type="button" class="dn" data-i="${i}" title="move down" ${i === waypoints.length - 1 ? 'disabled' : ''}>▼</button>
       <button type="button" class="ins" data-i="${i}" title="insert">+</button>
       ${waypoints.length > 2 ? `<button type="button" class="rm" data-i="${i}" title="remove">×</button>` : ''}`;
+    // Only an intermediate waypoint (not the start, not the final destination) can carry a
+    // forced stop — the start has no "arrive with" fuel state yet, and the destination has
+    // nothing left to drive that a forced fill would protect.
+    const mid = i > 0 && i < waypoints.length - 1;
+    const refuelRow = mid ? `
+    <div class="wp-row" style="margin-top:2px;align-items:center">
+      <label style="flex:none;display:flex;align-items:center;gap:4px;font-size:12px;color:var(--mut)">
+        <input type="checkbox" class="wp-refuel" data-i="${i}" style="width:auto" ${w.refuel ? 'checked' : ''}> refuel here
+      </label>
+      <input class="wp-radius" data-i="${i}" type="number" min="1" value="${w.radiusMi}" title="search radius, miles"
+        style="max-width:70px;${w.refuel ? '' : 'display:none'}">
+    </div>` : '';
     return `
-    <div class="wp-row">
-      <input class="wp" data-i="${i}" value="${v.replace(/"/g, '&quot;')}">
-      ${btns}
+    <div class="wp-block">
+      <div class="wp-row">
+        <input class="wp" data-i="${i}" value="${w.text.replace(/"/g, '&quot;')}">
+        ${btns}
+      </div>
+      ${refuelRow}
     </div>`;
   }).join('');
 }
 function saveWaypoints() { localStorage.setItem(WPKEY, JSON.stringify(waypoints)); }
+
+// Stray beforeend-appended <div class="warn"> messages (gap/final-leg/forced-stop-not-found —
+// see planCandidate) sit directly under #panel, not inside any of the elements cleared below;
+// left alone they'd stack up across replans instead of reflecting only the latest one.
+function clearPanelWarnings() { [...$('panel').querySelectorAll(':scope > .warn:not(#tankNote)')].forEach(el => el.remove()); }
 
 function clearPlanResults() {
   $('stops').innerHTML = '';
@@ -1103,12 +1203,22 @@ function clearPlanResults() {
   $('cmpBtn').style.display = 'none';
   $('compare').innerHTML = '';
   $('exportOut').innerHTML = '';
+  clearPanelWarnings();
   drawn.clearLayers(); // bug fix: a reorder/insert left the stale route polyline drawn with every panel empty
 }
 
 $('waypoints').addEventListener('input', e => {
-  if (!e.target.classList.contains('wp')) return;
-  waypoints[+e.target.dataset.i] = e.target.value;
+  const i = +e.target.dataset.i;
+  if (e.target.classList.contains('wp')) waypoints[i].text = e.target.value;
+  else if (e.target.classList.contains('wp-radius')) waypoints[i].radiusMi = clampRadius(e.target.value);
+  else return;
+  saveWaypoints();
+});
+$('waypoints').addEventListener('change', e => {
+  if (!e.target.classList.contains('wp-refuel')) return;
+  const i = +e.target.dataset.i;
+  waypoints[i].refuel = e.target.checked;
+  e.target.closest('.wp-block').querySelector('.wp-radius').style.display = waypoints[i].refuel ? '' : 'none';
   saveWaypoints();
 });
 
@@ -1121,7 +1231,7 @@ $('waypoints').addEventListener('click', e => {
     waypoints = moveWaypoint(waypoints, i, i + 1);
     renderWaypoints(); saveWaypoints(); clearPlanResults();
   } else if (e.target.classList.contains('ins')) {
-    waypoints = insertWaypoint(waypoints, i + 1);
+    waypoints = insertWaypoint(waypoints, i + 1, mkWaypoint(''));
     renderWaypoints(); saveWaypoints(); clearPlanResults();
   } else if (e.target.classList.contains('rm') && waypoints.length > 2) {
     waypoints.splice(i, 1);
@@ -1129,12 +1239,12 @@ $('waypoints').addEventListener('click', e => {
   }
 });
 
-$('addWp').addEventListener('click', () => { waypoints.push(''); renderWaypoints(); saveWaypoints(); });
+$('addWp').addEventListener('click', () => { waypoints.push(mkWaypoint('')); renderWaypoints(); saveWaypoints(); });
 
 function restoreWaypoints() {
   try {
     const raw = JSON.parse(localStorage.getItem(WPKEY));
-    if (Array.isArray(raw) && raw.length >= 2) waypoints = raw;
+    if (Array.isArray(raw) && raw.length >= 2) waypoints = raw.map(normalizeWaypoint);
   } catch { /* corrupt/stale value — defaults already set */ }
   renderWaypoints();
 }
@@ -1171,7 +1281,7 @@ function updateRange() {
 function saveVehicle() {
   localStorage.setItem(VKEY, JSON.stringify({
     y: $('vy').value, mk: $('vmk').value, md: $('vmd').value, tr: $('vtr').value,
-    mpg: $('mpg').value, gal: $('gal').value,
+    mpg: $('mpg').value, gal: $('gal').value, ed: galEdited,
   }));
 }
 
@@ -1204,13 +1314,18 @@ $('vtr').addEventListener('change', async () => {
     $('mpg').value = d.highway08;
     if (!galEdited) {
       $('gal').value = tankFromVClass(d.VClass);
-      $('tankNote').textContent = `Tank estimated from vehicle class (${d.VClass}) — check your manual.`;
+      $('tankNote').className = 'warn';
+      $('tankNote').textContent = `Estimated from vehicle class (${d.VClass}) — NOT from any ` +
+        `database (EPA's own record has no tank field). Check your manual or fuel door and correct this number.`;
     }
     updateRange(); saveVehicle();
   } catch (err) { say(err.message, true); }
 });
 $('mpg').addEventListener('input', () => { updateRange(); saveVehicle(); });
-$('gal').addEventListener('input', () => { galEdited = true; $('tankNote').textContent = ''; updateRange(); saveVehicle(); });
+$('gal').addEventListener('input', () => {
+  galEdited = true; $('tankNote').className = 'meta'; $('tankNote').textContent = '';
+  updateRange(); saveVehicle();
+});
 
 // Restore last pick from localStorage: mpg/gallons are instant, the dropdown
 // chain is a best-effort re-fetch that quietly gives up if EPA is unreachable.
@@ -1223,6 +1338,10 @@ async function restoreVehicle() {
   try { v = JSON.parse(raw); } catch { return; } // corrupt/stale value — ignore, defaults already set
   $('mpg').value = v.mpg || $('mpg').value;
   $('gal').value = v.gal || $('gal').value;
+  // Missing `ed` (older save, predates this field) means "not edited" — the default warn note
+  // in the markup already says the right thing and needs no touching. A true `ed` means the
+  // restored gal is the user's own verified number, not a class-average guess — silence the note.
+  if (v.ed) { galEdited = true; $('tankNote').className = 'meta'; $('tankNote').textContent = ''; }
   updateRange();
   if (!v.y) return;
   try {
@@ -1254,6 +1373,7 @@ async function run() {
   $('cmpBtn').style.display = 'none';
   $('compare').innerHTML = '';
   $('exportOut').innerHTML = '';
+  clearPanelWarnings();
   drawn.clearLayers();
   try {
     const baseMpg = vehicle().mpg;
@@ -1268,11 +1388,18 @@ async function run() {
     if (startFuel <= reserve) throw new Error('Starting fuel is already at or below your reserve');
     if (windBasis === 'typical' && !windDate) throw new Error('Pick a date for typical wind, or switch back to live forecast');
 
-    const queries = waypoints.map(w => w.trim()).filter(Boolean);
+    const activeWps = waypoints.filter(w => w.text.trim());
+    const queries = activeWps.map(w => w.text.trim());
     if (queries.length < 2) throw new Error('Add at least a start and a destination');
 
     say('Finding waypoints…');
     const pts0 = await Promise.all(queries.map(geocode));
+    // Forced ("refuel here") stops: only an intermediate waypoint qualifies (not the start,
+    // not the final destination — see renderWaypoints), carried alongside its geocoded
+    // lat/lon/label so planCandidate never has to re-match it against candidate.coords (which
+    // may include a synthetic corridor-discovery anchor point — see discoverCandidatesChain).
+    const forcedWps = pts0.map((p, i) => ({ ...p, refuel: activeWps[i].refuel, radiusMi: activeWps[i].radiusMi }))
+      .filter((w, i) => i > 0 && i < pts0.length - 1 && w.refuel);
 
     say('Finding route options…');
     // Two waypoints: OSRM's own alternatives=true plus perpendicular offset via-routes (see
@@ -1287,7 +1414,7 @@ async function run() {
     }
     if (!candidates.length) throw new Error('OSRM returned no usable route for these waypoints');
 
-    const ctx = { baseMpg, rangeKm, reserve, startFuel, overLimitMph, windBasis, windDate };
+    const ctx = { baseMpg, rangeKm, reserve, startFuel, overLimitMph, windBasis, windDate, forcedWps };
     renderOptions(candidates, ctx);
     if (candidates.length === 1) {
       $('routeOptions').firstElementChild?.classList.add('sel');
@@ -1338,12 +1465,13 @@ function renderOptions(candidates, ctx) {
 // The rest of the pipeline (full geometry, terrain/wind, Overpass, greedy stop planning) runs
 // only for the option the user picked — Overpass and Open-Meteo are never spent on candidates
 // that don't get chosen.
-async function planCandidate(candidate, { baseMpg, rangeKm, reserve, startFuel, overLimitMph, windBasis, windDate }) {
+async function planCandidate(candidate, { baseMpg, rangeKm, reserve, startFuel, overLimitMph, windBasis, windDate, forcedWps }) {
   $('go').disabled = true;
   $('stops').innerHTML = '';
   $('econ').innerHTML = '';
   $('wpInfo').innerHTML = '';
   $('exportOut').innerHTML = '';
+  clearPanelWarnings();
   drawn.clearLayers();
   try {
     const legKm = rangeKm * (1 - reserve);
@@ -1377,7 +1505,7 @@ async function planCandidate(candidate, { baseMpg, rangeKm, reserve, startFuel, 
     const tankGal = rangeKm / kmPerGal;
     const totalGal = adjTotalKm / kmPerGal; // same axis as effective mpg — see renderTripFuel
 
-    if (adjTotalKm <= firstLegKm) {
+    if (adjTotalKm <= firstLegKm && !forcedWps.length) {
       const fuel = fuelAtWaypoints(currentTrip.legBounds, [], toAdj, kmPerGal, tankGal, startFuel);
       renderWaypointArrivals(currentTrip.legBounds, currentTrip.waypoints, fuel.waypoints, reserve);
       renderTripFuel(totalGal, 0);
@@ -1385,25 +1513,58 @@ async function planCandidate(candidate, { baseMpg, rangeKm, reserve, startFuel, 
       return;
     }
 
+    // Forced ("refuel here") stops, resolved independently of whether the route needs any
+    // *optional* stops at all — a trip that technically fits in one tank can still carry a
+    // forced stop (the point is guaranteeing a fill near a specific place, e.g. the last town
+    // before a fuel-less destination, not filling a range gap). Each is a direct-radius Overpass
+    // search around the waypoint (findForcedStation) reusing the same amenity=fuel query the
+    // on-route sweep below runs, just at the user's own radius instead of SEARCH_RADIUS_M.
+    let forcedStops = [];
+    for (const fw of forcedWps) {
+      say(`Looking for a fuel station near ${fw.label.split(',')[0]}…`);
+      const station = await findForcedStation(fw);
+      if (!station) {
+        $('panel').insertAdjacentHTML('beforeend', `<div class="warn">No mapped fuel station within ` +
+          `${fw.radiusMi} mi of ${fw.label.split(',')[0]} — try a larger radius.</div>`);
+        continue;
+      }
+      const proj = project([station.lat, station.lon], pts, cum);
+      const rate = axisRate(sampleKm, adjCum, proj.km);
+      forcedStops.push({ ...station, detour: proj.detour, adjDetour: proj.detour * rate,
+        realKm: proj.km, km: toAdj(proj.km), forced: true });
+    }
+    forcedStops.sort((a, b) => a.km - b.km);
+    forcedStops = dedupeForced(forcedStops);
+
     // Search windows (in real km — what fetchStations works in) around each ideal stop point on
     // the fuel-adjusted axis, generous so the greedy pass still has options when it lands short.
-    const windows = [];
-    for (let d = firstLegKm; d < adjTotalKm; d += legKm) windows.push([toReal(d - legKm * 0.5), toReal(d) + 5]);
+    // Skipped entirely when the whole trip fits in one tank and there's no forced stop pulling
+    // in an otherwise-unneeded search.
+    let stations = [];
+    if (adjTotalKm > firstLegKm) {
+      const windows = [];
+      for (let d = firstLegKm; d < adjTotalKm; d += legKm) windows.push([toReal(d - legKm * 0.5), toReal(d) + 5]);
 
-    const raw = await fetchStations(pts, cum, windows);
-    if (!raw.length) throw new Error('No gas stations found near this route in OpenStreetMap');
+      const raw = await fetchStations(pts, cum, windows);
+      if (!raw.length && !forcedStops.length) throw new Error('No gas stations found near this route in OpenStreetMap');
 
-    // Each station carries both positions: `km` (fuel-adjusted) drives planStops below,
-    // `realKm` is what gets shown to the user as the mile marker. Likewise `detour` (real km,
-    // for display — "0.4 mi off route" must stay a real mile) vs `adjDetour` (the same detour
-    // burned at the local fuel-cost rate, so planStops compares apples to apples against `km`).
-    const stations = raw.map(s => {
-      const proj = project([s.lat, s.lon], pts, cum);
-      const rate = axisRate(sampleKm, adjCum, proj.km);
-      return { ...s, detour: proj.detour, adjDetour: proj.detour * rate, realKm: proj.km, km: toAdj(proj.km) };
-    }).filter(s => s.detour < 3.5);
+      // Each station carries both positions: `km` (fuel-adjusted) drives planStops below,
+      // `realKm` is what gets shown to the user as the mile marker. Likewise `detour` (real km,
+      // for display — "0.4 mi off route" must stay a real mile) vs `adjDetour` (the same detour
+      // burned at the local fuel-cost rate, so planStops compares apples to apples against `km`).
+      stations = raw.map(s => {
+        const proj = project([s.lat, s.lon], pts, cum);
+        const rate = axisRate(sampleKm, adjCum, proj.km);
+        return { ...s, detour: proj.detour, adjDetour: proj.detour * rate, realKm: proj.km, km: toAdj(proj.km) };
+      }).filter(s => s.detour < 3.5);
+      // A station the general sweep found essentially on top of a forced stop must not also
+      // survive as a second, separate pick a mile away — see dropNearForced.
+      if (forcedStops.length) stations = dropNearForced(stations, forcedStops);
+    }
 
-    const { stops, gap, finalLeg } = planStops(stations, adjTotalKm, firstLegKm, legKm);
+    const { stops, gap, finalLeg } = forcedStops.length
+      ? planStopsPartitioned(stations, forcedStops, adjTotalKm, firstLegKm, legKm)
+      : planStops(stations, adjTotalKm, firstLegKm, legKm);
     const stepCum = stepCumulative(route);
     const durAt = km => interpAxis(stepCum.km, stepCum.s, km); // real km -> cumulative seconds
     stops.forEach((s, i) => {
@@ -1551,7 +1712,7 @@ function render(stops, totalKm, route, finalLegDurationS, stopFuel, reserve) {
     const f = stopFuel[i];
     const low = f.pct <= reserve * 100;
     $('stops').insertAdjacentHTML('beforeend', `<li>
-      <div class="name"><span class="n">${i + 1}</span>${s.name}</div>
+      <div class="name"><span class="n">${i + 1}</span>${s.name}${s.forced ? ' <span class="meta">(your required stop)</span>' : ''}</div>
       <div class="meta">mile ${mi(s.realKm)} · ${mi(s.realLeg)} mi / ${fmtDuration(s.legDurationS)} since last fill · ${(s.detour * 1000 / KM_PER_MI / 1000).toFixed(1)} mi off route
         · arrive with ≈ ${f.gal.toFixed(1)} gal (${f.pct.toFixed(0)}%)
         ${s.open ? '· ' + s.open : ''}
@@ -2020,6 +2181,97 @@ if (new URLSearchParams(location.search).get('test')) {
   const wp2 = ['A', 'B'];
   ok(moveWaypoint(wp2, 0, 1).length === 2, 'moveWaypoint on 2-element list returns 2 elements');
   ok(insertWaypoint(wp2, 1).length === 3, 'insertWaypoint on 2-element list returns 3 elements (insertion allowed, removal blocked)');
+
+  // Forced ("refuel here") stop: waypoint state round-trips old saves, moveWaypoint/insertWaypoint
+  // carry the flag, partitioning produces the right stop sequence, and fuel accounting through a
+  // forced stop stays correct — the four things the report was asked to cover explicitly.
+
+  // Requirement 9: old localStorage saves were bare strings; a saved object might also predate
+  // the refuel/radiusMi fields entirely. Either way, loading it must default to unchecked, not crash.
+  ok(JSON.stringify(normalizeWaypoint('Denver, CO')) === JSON.stringify(mkWaypoint('Denver, CO')),
+    'a bare string from an old save normalizes to an unchecked waypoint');
+  ok(normalizeWaypoint({ text: 'Fernley, NV' }).refuel === false,
+    'a saved object missing the refuel field defaults to unchecked, not a crash');
+  ok(normalizeWaypoint({ text: 'Fernley, NV', refuel: true, radiusMi: 25 }).radiusMi === 25,
+    'a fully-populated saved waypoint round-trips its radius');
+
+  // A null/undefined/non-object entry (corrupt localStorage, or a hand-edited save) must not
+  // throw inside restoreWaypoints()'s .map() — that would discard the whole trip, not just the
+  // one bad entry (typeof null === 'object', so it used to reach w.text and throw).
+  ok(JSON.stringify(normalizeWaypoint(null)) === JSON.stringify(mkWaypoint('')),
+    'a null waypoint entry normalizes to an empty waypoint instead of throwing');
+  ok(JSON.stringify(normalizeWaypoint(undefined)) === JSON.stringify(mkWaypoint('')),
+    'an undefined waypoint entry normalizes to an empty waypoint instead of throwing');
+  ok(JSON.stringify(normalizeWaypoint(42)) === JSON.stringify(mkWaypoint('')),
+    'a non-object waypoint entry normalizes to an empty waypoint instead of throwing');
+
+  // A negative/zero/non-numeric radius (typed directly, bypassing the HTML min="1") must clamp
+  // to a positive minimum, not reach Overpass as a negative `around:` radius.
+  ok(clampRadius(-5) === 1, `negative radius clamps to 1: ${clampRadius(-5)}`);
+  ok(clampRadius(0) === DEFAULT_REFUEL_RADIUS_MI, `zero radius falls back to the default: ${clampRadius(0)}`);
+  ok(clampRadius(NaN) === DEFAULT_REFUEL_RADIUS_MI, `non-numeric radius falls back to the default: ${clampRadius(NaN)}`);
+  ok(clampRadius('abc') === DEFAULT_REFUEL_RADIUS_MI, `garbage string radius falls back to the default: ${clampRadius('abc')}`);
+  ok(normalizeWaypoint({ text: 'Fernley, NV', radiusMi: -5 }).radiusMi === 1,
+    'a saved waypoint with a negative radius clamps on load, not just on live input');
+
+  // Requirement 8: refuel flag and radius are just data on the waypoint object — moveWaypoint
+  // and insertWaypoint are generic array ops (proven above with plain strings) and must carry
+  // that data with its waypoint untouched.
+  const wpObjs = [mkWaypoint('Lakewood, CO'), { ...mkWaypoint('Fernley, NV'), refuel: true, radiusMi: 12 }, mkWaypoint('Black Rock City, NV')];
+  const movedObjs = moveWaypoint(wpObjs, 1, 0);
+  ok(movedObjs[0].refuel === true && movedObjs[0].radiusMi === 12,
+    `moveWaypoint carries the refuel flag/radius with its waypoint: ${JSON.stringify(movedObjs[0])}`);
+  const insertedObjs = insertWaypoint(wpObjs, 1, mkWaypoint(''));
+  ok(insertedObjs[2].refuel === true && insertedObjs[2].radiusMi === 12,
+    `insertWaypoint shifts the flagged waypoint without disturbing its data: ${JSON.stringify(insertedObjs[2])}`);
+
+  // Requirement 1: dedup helpers used to keep a forced stop from doubling up with either
+  // another forced stop or a station the general sweep found on its own (requirement 4).
+  const twoCloseForced = [{ realKm: 500 }, { realKm: 500.5 }, { realKm: 900 }];
+  const dedupedForced = dedupeForced(twoCloseForced);
+  ok(dedupedForced.length === 2, `two forced stops within ${FORCED_DEDUPE_KM}km collapse to one, a distant third stays: ${dedupedForced.length}`);
+  ok(dedupedForced[0].realKm === 500 && dedupedForced[1].realKm === 900, 'keeps the earlier of the two close forced stops');
+  const near = { name: 'dup', realKm: 500.3 }, far = { name: 'clear', realKm: 520 };
+  const droppedNear = dropNearForced([near, far], [{ realKm: 500 }]);
+  ok(droppedNear.length === 1 && droppedNear[0].name === 'clear',
+    `a general-sweep station within ${FORCED_DEDUPE_KM}km of a forced stop is dropped, one further away is kept: ${droppedNear.map(s => s.name)}`);
+
+  // Requirement 1/3/7: planStopsPartitioned splits the route at each forced stop and runs the
+  // existing planStops on each sub-leg independently, concatenating the results — planStops
+  // itself (already covered by the self-checks above) is never modified.
+  const forcedAt500 = { name: 'Fernley-ish', km: 500, realKm: 500, forced: true };
+  const exactRangePlan = planStopsPartitioned([], [forcedAt500], 1000, 500, 500);
+  ok(exactRangePlan.stops.length === 1 && exactRangePlan.stops[0].forced,
+    `a forced stop exactly at the range boundary needs no extra stops either side: ${exactRangePlan.stops.length}`);
+  ok(exactRangePlan.stops[0].km === 500, 'the forced stop keeps its own km position through partitioning');
+
+  // Requirement 3: a forced stop farther than one tank's range from the start must still pull
+  // in a normal intermediate stop before it — verifying partitioning actually does this, not
+  // just assuming it falls out for free.
+  const farForced = { name: 'Fernley', km: 900, realKm: 900, forced: true };
+  const midStation = { name: 'midway', km: 480, realKm: 480, detour: 0.1 };
+  const partFar = planStopsPartitioned([midStation], [farForced], 1400, 500, 500);
+  ok(partFar.stops.length === 2, `far forced stop still gets its intermediate stop first: ${partFar.stops.length} stops`);
+  ok(partFar.stops[0].name === 'midway' && partFar.stops[1].name === 'Fernley' && partFar.stops[1].forced,
+    `order is intermediate then forced: ${partFar.stops.map(s => s.name).join(' -> ')}`);
+
+  // Requirement 2: a gap inside a sub-leg after a forced stop is reported like an unpartitioned
+  // gap — offset onto the whole route's axis, not left in sub-leg-local coordinates — and the
+  // forced stop already reached still appears rather than the whole plan vanishing.
+  const gapForced = { name: 'Fernley', km: 300, realKm: 300, forced: true };
+  const gapPlan = planStopsPartitioned([], [gapForced], 1400, 500, 500);
+  ok(!!gapPlan.gap, 'an unreachable stretch after the forced stop still reports a gap, not a silent skip');
+  ok(gapPlan.gap[0] === 300 && gapPlan.gap[1] === 800, `gap offset onto the whole-route axis: ${gapPlan.gap}`);
+  ok(gapPlan.stops.length === 1 && gapPlan.stops[0].forced, 'the forced stop itself still appears even though the leg after it fails');
+
+  // Requirement 5: fuel accounting through a forced stop — fuelAtWaypoints treats it as just
+  // another refill event, and the trip total stays axis-only (unaffected by where stops land).
+  const idAdjF = km => km;
+  const withForced = fuelAtWaypoints([{ distKm: 0 }, { distKm: 100 }], [{ km: 60, forced: true }], idAdjF, 20, 10, 1);
+  ok(Math.abs(withForced.stops[0].gal - 7) < 1e-9,
+    `arrival at the forced stop, before the refill: 10gal - 60km/20 = ${withForced.stops[0].gal} gal`);
+  ok(Math.abs(withForced.waypoints[0].gal - 8) < 1e-9,
+    `waypoint after the forced stop refills first: full at km60, then (100-60)/20 burned = ${withForced.waypoints[0].gal} gal left`);
 
   console.log('%call self checks passed', 'color:green;font-weight:bold');
   say('Self checks passed — see console.');
