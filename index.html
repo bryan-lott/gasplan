@@ -33,6 +33,11 @@
        border-radius:50%; background:var(--accent); color:#fff; margin-right:6px; }
   a { color:var(--accent); }
   .warn { background:#fef3c7; color:#78350f; padding:8px; border-radius:5px; font-size:13px; margin-top:10px; }
+  /* Tank note lives inside the narrow "Tank (gal)" column, right under that input — a lighter,
+     left-accented treatment (vs. the full yellow block above) reads as attached to that one
+     field instead of a full-width callout about the whole vehicle section. */
+  #tankNote.warn { padding:5px 6px; font-size:11px; line-height:1.35; margin-top:5px; border-radius:3px;
+                    border-left:3px solid #d97706; }
   .wp-row { display:flex; gap:6px; margin-top:6px; }
   .wp-row input { flex:1; }
   .wp-row button { flex:none; width:30px; margin:0; padding:0; font-weight:400; }
@@ -59,9 +64,10 @@
   </div>
   <div class="row">
     <div><label for="mpg">Highway mpg</label><input id="mpg" type="number" value="24"></div>
-    <div><label for="gal">Tank (gal)</label><input id="gal" type="number" value="15"></div>
+    <div><label for="gal">Tank (gal)</label><input id="gal" type="number" value="15">
+      <div id="tankNote" class="warn">Generic default, not from any vehicle API. Verify against your manual or fuel door.</div>
+    </div>
   </div>
-  <div id="tankNote" class="warn">Not from any vehicle API — this is a generic default. Check your manual or fuel door and correct this number.</div>
   <div id="rangeInfo" class="meta"></div>
   <div class="row">
     <div><label for="fuel">Start fuel %</label><input id="fuel" type="number" value="100"></div>
@@ -1302,7 +1308,9 @@ function saveWaypoints() { localStorage.setItem(WPKEY, JSON.stringify(waypoints)
 // Stray beforeend-appended <div class="warn"> messages (gap/final-leg/forced-stop-not-found —
 // see planCandidate) sit directly under #panel, not inside any of the elements cleared below;
 // left alone they'd stack up across replans instead of reflecting only the latest one.
-function clearPanelWarnings() { [...$('panel').querySelectorAll(':scope > .warn:not(#tankNote)')].forEach(el => el.remove()); }
+// #tankNote now lives nested inside the Tank field's column (not a direct child of #panel),
+// so the `:scope > .warn` selector already skips it — no more explicit :not(#tankNote) needed.
+function clearPanelWarnings() { [...$('panel').querySelectorAll(':scope > .warn')].forEach(el => el.remove()); }
 
 function clearPlanResults() {
   $('stops').innerHTML = '';
@@ -1424,8 +1432,8 @@ $('vtr').addEventListener('change', async () => {
     if (!galEdited) {
       $('gal').value = tankFromVClass(d.VClass);
       $('tankNote').className = 'warn';
-      $('tankNote').textContent = `Estimated from vehicle class (${d.VClass}) — NOT from any ` +
-        `database (EPA's own record has no tank field). Check your manual or fuel door and correct this number.`;
+      $('tankNote').textContent = `Est. from vehicle class (${d.VClass}), not from any API ` +
+        `(EPA has no tank field). Verify against your manual or fuel door.`;
     }
     updateRange(); saveVehicle();
   } catch (err) { say(err.message, true); }
