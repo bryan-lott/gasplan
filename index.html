@@ -619,6 +619,7 @@ function fuelAtWaypoints(legBounds, stops, toAdj, kmPerGal, tankGal, startFuel) 
 // single biggest lever on Open-Meteo volume: see the request-count report for before/after.
 const elevCache = new Map(); // coordKey(pt) -> elevation metres
 const histCache = new Map(); // `${coordKey(pt)}|${startISO}|${endISO}` -> {daily}
+const geocodeCache = new Map(); // geocodeCacheKey(query) -> {lat,lon,label}
 
 // Rounds to the same 4-decimal precision (~11m) already sent to Open-Meteo, so two sample
 // points computed independently (e.g. compareCandidates' step geometry vs planCandidate's full
@@ -643,11 +644,20 @@ async function getJSON(url, opts = {}) {
   return res.json();
 }
 
+// Nominatim's usage policy caps the whole app at 1 request/second, summed across every user, and
+// requires results to be cached on our side — this isn't just an optimization, it's the terms of
+// using the free endpoint at all. Keyed on the normalized (trimmed, lowercased) query text, the
+// same "same real input -> same cache entry" shape elevCache already gives coordinates.
+function geocodeCacheKey(query) { return query.trim().toLowerCase(); }
 async function geocode(query) {
+  const cacheKey = geocodeCacheKey(query);
+  if (geocodeCache.has(cacheKey)) return geocodeCache.get(cacheKey);
   const j = await getJSON('https://nominatim.openstreetmap.org/search?format=json&limit=1&q=' +
                           encodeURIComponent(query));
   if (!j.length) throw new Error(`Could not find "${query}"`);
-  return { lat: +j[0].lat, lon: +j[0].lon, label: j[0].display_name };
+  const result = { lat: +j[0].lat, lon: +j[0].lon, label: j[0].display_name };
+  geocodeCache.set(cacheKey, result);
+  return result;
 }
 
 // coords: [{lat,lon}, ...], 2+ waypoints, OSRM takes them straight through in order.
@@ -766,6 +776,31 @@ async function discoverCandidatesChain(pts) {
   return kept.map((c, i) => ({ ...c, label: labels[i] }));
 }
 
+// Corridor discovery, cached on the full ordered waypoint-coordinate tuple — a replanned route
+// with the same waypoints (e.g. only mpg changed) should cost zero new OSRM discovery calls, the
+// same "replan costs nothing" lever elevCache/histCache/stationCache already give their hosts.
+// Keyed via coordKey (their existing 4dp/~11m rounding), not raw lat/lon: geocode() can return
+// the exact same float twice for an unchanged query (it's cached — see geocodeCacheKey), but
+// nothing here should depend on that; riding coordKey keeps this cache tolerant of the same
+// sub-11m jitter stationCacheKey already had to handle. discoverCandidates (2 waypoints) and
+// discoverCandidatesChain (3+) share one cache keyed on the point list itself — a 2-point key and
+// a 3+-point key never collide, so one Map safely covers both. Reordering or inserting a waypoint
+// changes the key (order and length both matter to the join), so those correctly miss and
+// re-discover — only a genuinely unchanged, same-order waypoint list hits.
+function discoveryCacheKey(pts) { return pts.map(p => coordKey([p.lat, p.lon])).join(';'); }
+const discoveryCache = new Map();
+// Two waypoints: OSRM's own alternatives=true plus perpendicular offset via-routes (see
+// discoverCandidates). 3+ waypoints: alternatives=true is silently ignored past 2 coordinates, so
+// discoverCandidatesChain keeps every user waypoint fixed & in order and hunts for an alternate
+// corridor only within the longest leg (see longestLegIndex).
+async function discoverCandidatesFor(pts) {
+  const cacheKey = discoveryCacheKey(pts);
+  if (discoveryCache.has(cacheKey)) return discoveryCache.get(cacheKey);
+  const candidates = pts.length === 2 ? await discoverCandidates(pts[0], pts[1]) : await discoverCandidatesChain(pts);
+  discoveryCache.set(cacheKey, candidates);
+  return candidates;
+}
+
 // Elevation for up to ELEV_BATCH points per request (Open-Meteo's hard cap). Keyless, CORS *.
 // Cached by coordKey (see elevCache) — a coordinate's elevation never changes, so a replanned
 // route (same corridor, same samples) fetches only whatever's genuinely new.
@@ -776,7 +811,7 @@ async function fetchElevations(points) {
     const batch = miss.slice(i, i + ELEV_BATCH);
     const lat = batch.map(i => points[i][0].toFixed(4)).join(',');
     const lon = batch.map(i => points[i][1].toFixed(4)).join(',');
-    const j = await getJSONRetry(`https://api.open-meteo.com/v1/elevation?latitude=${lat}&longitude=${lon}`);
+    const j = await getJSONRetry(`https://api.open-meteo.com/v1/elevation?latitude=${lat}&longitude=${lon}`, OPEN_METEO_RETRY);
     batch.forEach((i, k) => elevCache.set(keys[i], j.elevation[k]));
   }
   return keys.map(k => elevCache.get(k));
@@ -793,7 +828,7 @@ async function fetchWind(points, etaHours) {
   const lat = points.map(p => p[0].toFixed(4)).join(',');
   const lon = points.map(p => p[1].toFixed(4)).join(',');
   const j = await getJSONRetry('https://api.open-meteo.com/v1/forecast?' +
-    `latitude=${lat}&longitude=${lon}&hourly=wind_speed_10m,wind_direction_10m&wind_speed_unit=mph&timezone=UTC`);
+    `latitude=${lat}&longitude=${lon}&hourly=wind_speed_10m,wind_direction_10m&wind_speed_unit=mph&timezone=UTC`, OPEN_METEO_RETRY);
   const perPoint = Array.isArray(j) ? j : [j]; // verified: 1 location -> object, 2+ -> array
   const now = Date.now();
   return perPoint.map((p, i) => {
@@ -837,7 +872,7 @@ async function fetchHistoricalWind(points, etaHours, tripDate) {
         const lon = miss.map(i => points[i][1].toFixed(4)).join(',');
         const j = await getJSONRetry('https://archive-api.open-meteo.com/v1/archive?' +
           `latitude=${lat}&longitude=${lon}&start_date=${startS}&end_date=${endS}` +
-          `&daily=wind_speed_10m_mean,wind_direction_10m_dominant&wind_speed_unit=mph&timezone=UTC`);
+          `&daily=wind_speed_10m_mean,wind_direction_10m_dominant&wind_speed_unit=mph&timezone=UTC`, OPEN_METEO_RETRY);
         const perPoint = Array.isArray(j) ? j : [j]; // same object-vs-array trap as fetchWind
         miss.forEach((i, k) => histCache.set(keyFor(i), perPoint[k].daily));
       }
@@ -893,18 +928,28 @@ function searchCentres(pts, cum, [from, to]) {
 function transientRetryable(err) {
   return !!err.opaque || /429|503|504/.test(err.message);
 }
-// Open-Meteo's 429 is our own burst hitting its per-minute cap, not a real outage — worth a
-// retry, but capped low (3 tries, ~1s+2s wait) so a genuine failure still surfaces in a few
-// seconds instead of hanging: that's what the existing degrade-to-"unadjusted" path is for.
-async function getJSONRetry(url, attempts = 3) {
+// Default retry budget (3 attempts, up to 45s each, 1s/2s backoff -> ~138s worst case) is sized
+// for Overpass, where station data is load-bearing and worth waiting on. Open-Meteo gets its own,
+// much tighter budget — see OPEN_METEO_RETRY just below.
+async function getJSONRetry(url, { attempts = 3, timeout, backoffMs = 1000 } = {}) {
   for (let i = 0; ; i++) {
-    try { return await getJSON(url); }
+    try { return await getJSON(url, timeout ? { timeout } : {}); }
     catch (err) {
       if (i === attempts - 1 || !transientRetryable(err)) throw err;
-      await new Promise(done => setTimeout(done, 1000 * (i + 1)));
+      await new Promise(done => setTimeout(done, backoffMs * (i + 1)));
     }
   }
 }
+// Open-Meteo-specific override. Measured 2026-08-07 (see report): a normal 14-minute session of
+// ordinary sequential use hit a 100% 429 rate on Open-Meteo, well under its published 600/min
+// ceiling — a single planCandidate click makes exactly 2 sequential Open-Meteo calls, no burst at
+// all, so this reads as a shared-IP or undocumented burst effect on Open-Meteo's side rather than
+// something our own request pattern is causing. Since we can't fix Open-Meteo's throttling from
+// here, the fix is to stop paying for it: terrain/wind is an optional adjustment with a working
+// degrade-to-"unadjusted" path (see planEconomy's notes), unlike Overpass's load-bearing station
+// data, so it should fail loud and fast instead of hanging. 2 attempts, an 8s timeout, 1s flat
+// backoff -> worst case ~9s per fetch instead of the default's ~138s.
+const OPEN_METEO_RETRY = { attempts: 2, timeout: 8000, backoffMs: 1000 };
 async function postOverpass(query) {
   const body = 'data=' + encodeURIComponent(query);
   let last;
@@ -1127,17 +1172,27 @@ async function planEconomy(pts, cum, route, overLimitMph, windBasis = 'live', wi
   const steps = stepSpeeds(route);
   const notes = [];
 
+  // Elevation and wind are independent Open-Meteo fetches; run them concurrently so their
+  // worst-case stalls (now capped by OPEN_METEO_RETRY, ~9s each) overlap instead of adding —
+  // roughly halves the dead-wait before this degrades to unadjusted economy. This is a different
+  // situation from compareCandidates' corridor loop just below in the file, which deliberately
+  // stayed sequential after measuring that 3 corridors x 2 calls (6 at once) triggered genuine
+  // 429s: this is exactly 2 concurrent requests per plan, not a multi-corridor burst, and either
+  // way a failure now gives up in seconds (OPEN_METEO_RETRY) rather than minutes, bounding the
+  // downside if 2-at-once does turn out to be measurably worse than 1-at-a-time.
+  const etaHours = sampleKm.map(km => (route.duration / 3600) * (km / totalKm));
+  const [elevResult, windResult] = await Promise.allSettled([
+    fetchElevations(samplePts),
+    windBasis === 'typical' ? historicalWinds(sampleKm, samplePts, etaHours, windDate) : fetchWind(samplePts, etaHours),
+  ]);
+
   let elevations = null;
-  try { elevations = await fetchElevations(samplePts); }
-  catch (err) { notes.push(`terrain (${err.message})`); }
+  if (elevResult.status === 'fulfilled') elevations = elevResult.value;
+  else notes.push(`terrain (${elevResult.reason.message})`);
 
   let winds = null;
-  try {
-    const etaHours = sampleKm.map(km => (route.duration / 3600) * (km / totalKm));
-    winds = windBasis === 'typical'
-      ? await historicalWinds(sampleKm, samplePts, etaHours, windDate)
-      : await fetchWind(samplePts, etaHours);
-  } catch (err) { notes.push(`wind (${err.message})`); }
+  if (windResult.status === 'fulfilled') winds = windResult.value;
+  else notes.push(`wind (${windResult.reason.message})`);
 
   return { sampleKm, notes, windBasis, windDate, ...buildFuelAxis(sampleKm, samplePts, elevations, winds, steps, overLimitMph) };
 }
@@ -1519,16 +1574,7 @@ async function run() {
       .filter((w, i) => i > 0 && i < pts0.length - 1 && w.refuel);
 
     say('Finding route options…');
-    // Two waypoints: OSRM's own alternatives=true plus perpendicular offset via-routes (see
-    // discoverCandidates). 3+ waypoints: alternatives=true is silently ignored past 2
-    // coordinates, so discoverCandidatesChain keeps every user waypoint fixed & in order and
-    // hunts for an alternate corridor only within the longest leg (see longestLegIndex).
-    let candidates;
-    if (pts0.length === 2) {
-      candidates = await discoverCandidates(pts0[0], pts0[1]);
-    } else {
-      candidates = await discoverCandidatesChain(pts0);
-    }
+    const candidates = await discoverCandidatesFor(pts0);
     if (!candidates.length) throw new Error('OSRM returned no usable route for these waypoints');
 
     const ctx = { baseMpg, rangeKm, reserve, startFuel, overLimitMph, windBasis, windDate, forcedWps };
@@ -2073,6 +2119,33 @@ if (new URLSearchParams(location.search).get('test')) {
     'a genuinely different centre misses the station-cache key');
   ok(stationCacheKey(centresA, 3000) !== stationCacheKey(centresA, 5000),
     'the same centres at a different radius are a different search, not a cache hit');
+
+  // geocode cache (geocodeCacheKey): normalized (trimmed, lowercased) query text hits on
+  // whitespace/case-only differences, a genuinely different query misses — the two behaviours
+  // Nominatim's "results must be cached" policy actually needs, without a jittery key silently
+  // never hitting the way the station-cache bug (above) once did.
+  ok(geocodeCacheKey('  Denver, CO  ') === geocodeCacheKey('denver, co'),
+    `whitespace/case differences on the same query hit the same cache key: ${geocodeCacheKey('  Denver, CO  ')}`);
+  ok(geocodeCacheKey('Denver, CO') !== geocodeCacheKey('Chicago, IL'),
+    'a genuinely different query misses the cache key');
+
+  // Discovery cache (discoveryCacheKey): rides on coordKey the same jitter-tolerant way
+  // stationCacheKey does (a replanned route's OSRM-derived waypoints can land a few metres off
+  // the previous call — see stationCacheKey's comment), so sub-11m float jitter across every
+  // waypoint still hits. Changing what's actually different about the trip — reordering or
+  // inserting a waypoint, or a genuinely different coordinate — must all miss.
+  const wpA = { lat: 39.73921, lon: -104.99031 }, wpB = { lat: 40.7895, lon: -119.2077 },
+        wpMid = { lat: 39.6079, lon: -119.2506 };
+  const tripAB = [wpA, wpB];
+  const tripABJitter = [{ lat: 39.73924, lon: -104.99034 }, { lat: 40.78954, lon: -119.20774 }]; // < 11m jitter
+  const tripBA = [wpB, wpA]; // reordered
+  const tripAMidB = [wpA, wpMid, wpB]; // a waypoint inserted
+  ok(discoveryCacheKey(tripAB) === discoveryCacheKey(tripABJitter),
+    `sub-11m coordinate jitter across every waypoint still hits the same discovery-cache key: ${discoveryCacheKey(tripAB)}`);
+  ok(discoveryCacheKey(tripAB) !== discoveryCacheKey(tripBA),
+    'reordering the same waypoints misses — order changes the route');
+  ok(discoveryCacheKey(tripAB) !== discoveryCacheKey(tripAMidB),
+    'inserting a waypoint misses — a genuinely different trip');
 
   // Route labeling: distance-weighted refs, majors preferred over bare numbers, semicolon-joined
   // refs keep only the first, internal spaces become hyphens.
