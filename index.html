@@ -45,6 +45,10 @@
   .opt { border:1px solid var(--line); border-radius:5px; padding:8px 10px; margin-top:8px; cursor:pointer; }
   .opt:hover { border-color:var(--accent); }
   .opt.sel { border-color:var(--accent); background:rgba(194,65,12,.08); }
+  .badge { display:inline-block; padding:1px 6px; border-radius:3px; font-size:10px; font-weight:600;
+           margin-left:5px; vertical-align:middle; }
+  .badge.fuel { background:rgba(194,65,12,.15); color:var(--accent); }
+  .badge.hours { background:rgba(22,163,74,.18); color:#16a34a; }
 </style>
 </head>
 <body>
@@ -53,6 +57,11 @@
   <label>Waypoints, in order</label>
   <div id="waypoints"></div>
   <button id="addWp" type="button">+ add destination</button>
+  <div class="row">
+    <button id="reverseWp" type="button">⇄ Reverse trip</button>
+    <button id="shareBtn" type="button">Copy share link</button>
+  </div>
+  <div id="shareOut" class="meta"></div>
   <label>Vehicle (optional lookup)</label>
   <div class="row">
     <select id="vy" disabled><option value="">Year…</option></select>
@@ -69,6 +78,12 @@
     </div>
   </div>
   <div id="rangeInfo" class="meta"></div>
+  <label for="fuelType">Fuel type</label>
+  <select id="fuelType">
+    <option value="gasoline">Gasoline</option>
+    <option value="diesel">Diesel</option>
+    <option value="e85">E85</option>
+  </select>
   <div class="row">
     <div><label for="fuel">Start fuel %</label><input id="fuel" type="number" value="100"></div>
     <div><label for="reserve">Reserve %</label><input id="reserve" type="number" value="15"></div>
@@ -991,6 +1006,33 @@ async function mapConcurrent(items, limit, fn) {
   return results;
 }
 
+// --- fuel type: three-way yes/no/missing distinction (pure) -----------------
+// OSM tags fuel:diesel=yes/no directly on the node. Missing the tag entirely is NOT the same as
+// "no" — OSM fuel-type coverage is spotty, plenty of good stations were just never surveyed for
+// this tag. Collapsing "no" and "missing" into one falsy check is the bug this feature exists to
+// avoid, so the three cases stay explicit here rather than folded into a single ?. or ||.
+// Gasoline has no dedicated fuel:gasoline key in OSM's tagging scheme (it's the assumed default
+// for a fuel=amenity node), so it maps to no tag key at all and always reads as "unknown".
+const FUEL_TAG = { gasoline: null, diesel: 'fuel:diesel', e85: 'fuel:e85' };
+function fuelTagValue(tags, fuelType) {
+  const key = FUEL_TAG[fuelType];
+  const v = key && tags ? tags[key] : undefined;
+  return v === 'yes' ? 'yes' : v === 'no' ? 'no' : null; // null covers both "missing" and "any
+                                                          // other value" (e.g. free text) — treat
+                                                          // as unknown rather than guess.
+}
+// The only exclusion case: an explicit "no". "yes" and "unknown/missing" both pass through — see
+// fuelTagValue's comment on why those two must not collapse together.
+function filterFuelType(stations, fuelType) {
+  return stations.filter(s => fuelTagValue(s.tags, fuelType) !== 'no');
+}
+// ponytail: opening_hours is OSM's full mini-language (weekday ranges, holidays, seasons, date
+// exceptions) — a real parser is a library-sized dependency (see opening_hours.js on npm). We only
+// ever show the raw string as-is and special-case the one literal token that actually matters for
+// "will this be open at 2am on a long drive": 24/7. Upgrade to a real parser if a richer check
+// (e.g. "open at my ETA") is ever needed — don't hand-roll the grammar here.
+function is247(openStr) { return !!openStr && openStr.trim() === '24/7'; }
+
 // Photon (komoot's keyless, CORS-open geocoder) as a fuel-station fallback for when Overpass is
 // genuinely down (see overpassFuel) — not a primary replacement. Measured 2026-08-07: /reverse's
 // per-request cost is flat regardless of radius (3km and 150km near Denver both under 1.1s), the
@@ -1005,8 +1047,10 @@ async function photonFuelOne(centre, radiusM) {
   const j = await getJSONRetry(`https://photon.komoot.io/reverse?lat=${centre[0].toFixed(5)}&lon=${centre[1].toFixed(5)}` +
     `&osm_tag=amenity:fuel&radius=${(radiusM / 1000).toFixed(2)}&limit=50`);
   return j.features.map(f => ({ lat: f.geometry.coordinates[1], lon: f.geometry.coordinates[0],
-    name: f.properties.name || 'Unnamed fuel station', brand: '', open: '' })); // Photon doesn't
-    // expose brand/opening_hours tags — left honestly blank rather than guessed.
+    name: f.properties.name || 'Unnamed fuel station', brand: '', open: '', tags: {} })); // Photon
+    // doesn't expose brand/opening_hours/fuel:* tags — left honestly blank/empty rather than
+    // guessed. tags:{} (not omitted) so fuelTagValue sees "no tag" uniformly and every badge
+    // silently doesn't render, same as an Overpass station with no fuel:* tags at all.
 }
 // centres.length > 1 only happens on the Overpass-exhausted fallback path (a whole chunk's worth
 // of centres) — run with the same concurrency cap as the main sweep since Photon still only
@@ -1033,6 +1077,9 @@ async function overpassFuel(centres, radiusM = SEARCH_RADIUS_M) {
   if (stationCache.has(cacheKey)) return stationCache.get(cacheKey);
   let stations;
   try {
+    // "out center 300;" already returns full tags at Overpass's default "body" verbosity — no
+    // verbosity keyword needed to get fuel:*/opening_hours, and no extra centre/query cost either
+    // (verified: same query, payload just carries more fields per element already coming back).
     const j = await postOverpass(
       `[out:json][timeout:60];nwr(around:${radiusM},${around})[amenity=fuel];out center 300;`);
     stations = j.elements.map(el => {
@@ -1040,7 +1087,7 @@ async function overpassFuel(centres, radiusM = SEARCH_RADIUS_M) {
       if (lat == null) return null;
       const t = el.tags || {};
       return { lat, lon, name: t.name || t.brand || t.operator || 'Unnamed fuel station',
-               brand: t.brand || '', open: t['opening_hours'] || '' };
+               brand: t.brand || '', open: t['opening_hours'] || '', tags: t };
     }).filter(Boolean);
   } catch (err) {
     if (!err.exhausted) throw err; // a real failure (e.g. malformed query) — don't paper over it
@@ -1058,9 +1105,9 @@ async function overpassFuel(centres, radiusM = SEARCH_RADIUS_M) {
 // there's no "further along route is better" concept for a single anchor point, and nearest
 // minimises the detour from the actual place the user named. No candidates within radius ->
 // null, which the caller turns into a visible warning rather than a silent fallback.
-async function findForcedStation(wp) {
+async function findForcedStation(wp, fuelType) {
   const centre = [wp.lat, wp.lon];
-  const found = await overpassFuel([centre], wp.radiusMi * KM_PER_MI * 1000);
+  const found = filterFuelType(await overpassFuel([centre], wp.radiusMi * KM_PER_MI * 1000), fuelType);
   if (!found.length) return null;
   return found.reduce((a, b) => haversine(centre, [b.lat, b.lon]) < haversine(centre, [a.lat, a.lon]) ? b : a);
 }
@@ -1290,6 +1337,12 @@ function insertWaypoint(list, index, item = '') {
   return newList;
 }
 
+// Swaps origin/destination and reverses the intermediate order for a there-and-back trip. Plain
+// array reverse — refuel/radiusMi live on each waypoint object (see mkWaypoint), so they travel
+// with it for free, same as moveWaypoint/insertWaypoint already do. Reversing twice is therefore
+// exactly the identity, not just approximately (see self-check).
+function reverseTrip(list) { return [...list].reverse(); }
+
 // --- UI --------------------------------------------------------------------
 
 const $ = id => document.getElementById(id);
@@ -1302,6 +1355,23 @@ let routeLineLayer = null; // the plain polyline drawn before economy is known; 
                             // per-segment colour once planEconomy resolves — see drawEconLine.
 
 function say(msg, isError) { $('status').textContent = msg; $('status').className = isError ? 'err' : ''; }
+
+// --- share trip by URL (decode half) ----------------------------------------
+// JSON + encodeURIComponent, not base64: stays plain-text-debuggable in the URL bar and sidesteps
+// btoa's UTF-16/latin1 choke on an accented waypoint name (e.g. "Montréal"). Decoded once at load,
+// below, before localStorage's own restore runs — see restoreWaypoints/restoreVehicle.
+// Never throws: a garbage/hand-edited hash must fall through to localStorage exactly as if there
+// were no hash at all, not wipe a saved trip (see self-checks — there's history here of a parse
+// path doing exactly that).
+function decodeTripHash(hash) {
+  try {
+    const raw = new URLSearchParams(hash.replace(/^#/, '')).get('trip');
+    if (!raw) return null;
+    const t = JSON.parse(raw);
+    return t && typeof t === 'object' && Array.isArray(t.wp) ? t : null;
+  } catch { return null; }
+}
+const hashTrip = decodeTripHash(location.hash);
 
 // --- waypoints ---------------------------------------------------------------
 // Ordered destination list, min 2 rows. Persisted to localStorage alongside the vehicle so a
@@ -1413,14 +1483,28 @@ $('waypoints').addEventListener('click', e => {
 
 $('addWp').addEventListener('click', () => { waypoints.push(mkWaypoint('')); renderWaypoints(); saveWaypoints(); });
 
-function restoreWaypoints() {
+$('reverseWp').addEventListener('click', () => {
+  waypoints = reverseTrip(waypoints);
+  renderWaypoints(); saveWaypoints();
+  run(); // reuse the normal replan path — no separate reverse-and-plan logic
+});
+
+// fromArray (a share-hash's wp[]) wins when present; either way every entry is routed through
+// normalizeWaypoint, so hash contents get exactly the same null/shape guarding a localStorage
+// save already gets — nothing from the URL is trusted directly onto `waypoints`.
+function restoreWaypoints(fromArray) {
+  if (Array.isArray(fromArray) && fromArray.length >= 2) {
+    waypoints = fromArray.map(normalizeWaypoint);
+    renderWaypoints();
+    return;
+  }
   try {
     const raw = JSON.parse(localStorage.getItem(WPKEY));
     if (Array.isArray(raw) && raw.length >= 2) waypoints = raw.map(normalizeWaypoint);
   } catch { /* corrupt/stale value — defaults already set */ }
   renderWaypoints();
 }
-restoreWaypoints();
+restoreWaypoints(hashTrip?.wp);
 
 // --- vehicle lookup (fueleconomy.gov) ---------------------------------------
 // Seam for the physics agent: vehicle() is the one place that reads mpg/gallons
@@ -1450,12 +1534,14 @@ function updateRange() {
   const r = vehicle().rangeMi;
   $('rangeInfo').textContent = r > 0 ? `≈ ${Math.round(r)} mi on a full tank` : '';
 }
-function saveVehicle() {
-  localStorage.setItem(VKEY, JSON.stringify({
-    y: $('vy').value, mk: $('vmk').value, md: $('vmd').value, tr: $('vtr').value,
-    mpg: $('mpg').value, gal: $('gal').value, ed: galEdited,
-  }));
+// Shape shared with the share-hash payload below (tripPayload) — one source of truth for what
+// "the vehicle" means to both localStorage and a share link.
+function vehicleState() {
+  return { y: $('vy').value, mk: $('vmk').value, md: $('vmd').value, tr: $('vtr').value,
+    mpg: $('mpg').value, gal: $('gal').value, ed: galEdited, fuelType: $('fuelType').value };
 }
+function saveVehicle() { localStorage.setItem(VKEY, JSON.stringify(vehicleState())); }
+$('fuelType').addEventListener('change', saveVehicle);
 
 $('vy').addEventListener('change', async () => {
   resetSelect($('vmk'), 'Make…'); resetSelect($('vmd'), 'Model…'); resetSelect($('vtr'), 'Trim…');
@@ -1499,17 +1585,21 @@ $('gal').addEventListener('input', () => {
   updateRange(); saveVehicle();
 });
 
-// Restore last pick from localStorage: mpg/gallons are instant, the dropdown
-// chain is a best-effort re-fetch that quietly gives up if EPA is unreachable.
-async function restoreVehicle() {
+// Restore last pick from localStorage (or vOverride, a share-hash's v{} — see tripPayload):
+// mpg/gallons are instant, the dropdown chain is a best-effort re-fetch that quietly gives up if
+// EPA is unreachable.
+async function restoreVehicle(vOverride) {
   updateRange();
   try { fillSelect($('vy'), await epaMenu('year'), 'Year…'); } catch (err) { say(err.message, true); return; }
-  const raw = localStorage.getItem(VKEY);
-  if (!raw) return;
-  let v;
-  try { v = JSON.parse(raw); } catch { return; } // corrupt/stale value — ignore, defaults already set
+  let v = vOverride;
+  if (!v) {
+    const raw = localStorage.getItem(VKEY);
+    if (!raw) return;
+    try { v = JSON.parse(raw); } catch { return; } // corrupt/stale value — ignore, defaults already set
+  }
   $('mpg').value = v.mpg || $('mpg').value;
   $('gal').value = v.gal || $('gal').value;
+  $('fuelType').value = v.fuelType || 'gasoline'; // missing (older save, predates this field) -> gasoline
   // Missing `ed` (older save, predates this field) means "not edited" — the default warn note
   // in the markup already says the right thing and needs no touching. A true `ed` means the
   // restored gal is the user's own verified number, not a class-average guess — silence the note.
@@ -1528,7 +1618,38 @@ async function restoreVehicle() {
     if (v.tr) $('vtr').value = v.tr;
   } catch (err) { /* picker restore failed — mpg/gallons above already have the real values */ }
 }
-restoreVehicle();
+restoreVehicle(hashTrip?.v);
+
+// --- share trip by URL (encode half + remaining planning inputs) ------------
+// waypoints and the vehicle picker are restored above; the rest of the user-set planning inputs
+// (not persisted to localStorage at all today — only waypoints/vehicle are, see WPKEY/VKEY) come
+// from the hash directly, same shape tripPayload below builds.
+if (hashTrip) {
+  ['fuel', 'reserve', 'price', 'over', 'windBasis', 'windDate'].forEach(k => {
+    if (hashTrip[k] != null) $(k).value = hashTrip[k];
+  });
+  $('windBasis').dispatchEvent(new Event('change')); // reuse the existing handler to fix up windDate's visibility/note
+}
+
+function tripPayload() {
+  return {
+    wp: waypoints, v: vehicleState(),
+    fuel: $('fuel').value, reserve: $('reserve').value, price: $('price').value,
+    over: $('over').value, windBasis: $('windBasis').value, windDate: $('windDate').value,
+  };
+}
+function hashFromPayload(payload) { return 'trip=' + encodeURIComponent(JSON.stringify(payload)); }
+
+$('shareBtn').addEventListener('click', async () => {
+  const url = `${location.origin}${location.pathname}#${hashFromPayload(tripPayload())}`;
+  try {
+    await navigator.clipboard.writeText(url);
+    $('shareOut').textContent = 'Link copied!';
+  } catch {
+    $('shareOut').textContent = url; // clipboard blocked (e.g. no permission) — show it to copy by hand
+  }
+  setTimeout(() => { $('shareOut').textContent = ''; }, 3000);
+});
 
 // Seam for the next agents: set once a candidate has been fully routed and planned.
 // legBounds[i] = {distKm, durationS} cumulative real distance/duration through waypoint i
@@ -1555,6 +1676,7 @@ async function run() {
     const overLimitMph = +$('over').value || 0;
     const windBasis = $('windBasis').value;
     const windDate = $('windDate').value;
+    const fuelType = $('fuelType').value;
     if (!(rangeKm > 0)) throw new Error('Set highway mpg and tank gallons to compute a range');
     if (reserve < 0 || reserve >= 1) throw new Error('Reserve must be between 0 and 99%');
     if (startFuel <= reserve) throw new Error('Starting fuel is already at or below your reserve');
@@ -1577,7 +1699,7 @@ async function run() {
     const candidates = await discoverCandidatesFor(pts0);
     if (!candidates.length) throw new Error('OSRM returned no usable route for these waypoints');
 
-    const ctx = { baseMpg, rangeKm, reserve, startFuel, overLimitMph, windBasis, windDate, forcedWps };
+    const ctx = { baseMpg, rangeKm, reserve, startFuel, overLimitMph, windBasis, windDate, forcedWps, fuelType };
     renderOptions(candidates, ctx);
     if (candidates.length === 1) {
       $('routeOptions').firstElementChild?.classList.add('sel');
@@ -1628,7 +1750,7 @@ function renderOptions(candidates, ctx) {
 // The rest of the pipeline (full geometry, terrain/wind, Overpass, greedy stop planning) runs
 // only for the option the user picked — Overpass and Open-Meteo are never spent on candidates
 // that don't get chosen.
-async function planCandidate(candidate, { baseMpg, rangeKm, reserve, startFuel, overLimitMph, windBasis, windDate, forcedWps }) {
+async function planCandidate(candidate, { baseMpg, rangeKm, reserve, startFuel, overLimitMph, windBasis, windDate, forcedWps, fuelType }) {
   $('go').disabled = true;
   $('stops').innerHTML = '';
   $('econ').innerHTML = '';
@@ -1685,7 +1807,7 @@ async function planCandidate(candidate, { baseMpg, rangeKm, reserve, startFuel, 
     let forcedStops = [];
     for (const fw of forcedWps) {
       say(`Looking for a fuel station near ${fw.label.split(',')[0]}…`);
-      const station = await findForcedStation(fw);
+      const station = await findForcedStation(fw, fuelType);
       if (!station) {
         $('panel').insertAdjacentHTML('beforeend', `<div class="warn">No mapped fuel station within ` +
           `${fw.radiusMi} mi of ${fw.label.split(',')[0]} — try a larger radius.</div>`);
@@ -1723,11 +1845,11 @@ async function planCandidate(candidate, { baseMpg, rangeKm, reserve, startFuel, 
       // `realKm` is what gets shown to the user as the mile marker. Likewise `detour` (real km,
       // for display — "0.4 mi off route" must stay a real mile) vs `adjDetour` (the same detour
       // burned at the local fuel-cost rate, so planStops compares apples to apples against `km`).
-      stations = raw.map(s => {
+      stations = filterFuelType(raw.map(s => {
         const proj = project([s.lat, s.lon], pts, cum);
         const rate = axisRate(sampleKm, adjCum, proj.km);
         return { ...s, detour: proj.detour, adjDetour: proj.detour * rate, realKm: proj.km, km: toAdj(proj.km) };
-      }).filter(s => s.detour < 3.5);
+      }).filter(s => s.detour < 3.5), fuelType);
       // A station the general sweep found essentially on top of a forced stop must not also
       // survive as a second, separate pick a mile away — see dropNearForced.
       if (forcedStops.length) stations = dropNearForced(stations, forcedStops);
@@ -1746,7 +1868,7 @@ async function planCandidate(candidate, { baseMpg, rangeKm, reserve, startFuel, 
     currentTrip.stops = stops;
     const fuel = fuelAtWaypoints(currentTrip.legBounds, stops, toAdj, kmPerGal, tankGal, startFuel);
     renderWaypointArrivals(currentTrip.legBounds, currentTrip.waypoints, fuel.waypoints, reserve);
-    render(stops, totalKm, route, finalLegDurationS, fuel.stops, reserve);
+    render(stops, totalKm, route, finalLegDurationS, fuel.stops, reserve, fuelType);
     renderTripFuel(totalGal, stops.length);
     if (gap) $('panel').insertAdjacentHTML('beforeend',
       `<div class="warn">No mapped station between mile ${mi(toReal(gap[0]))} and ${mi(toReal(gap[1]))} — ` +
@@ -1875,7 +1997,15 @@ function renderWaypointArrivals(legBounds, waypointPts, fuel, reserve) {
   $('wpInfo').innerHTML = `<div class="meta">Driving times are OSRM's free-flow routing estimate — no traffic, no stop time.</div>` + rows;
 }
 
-function render(stops, totalKm, route, finalLegDurationS, stopFuel, reserve) {
+// Badge, don't filter (filtering already happened — see filterFuelType in planCandidate): a
+// positive badge only for an explicit "yes", nothing at all for unknown/missing. See fuelTagValue.
+function fuelBadgeHtml(station, fuelType) {
+  return fuelTagValue(station.tags, fuelType) === 'yes'
+    ? `<span class="badge fuel">${fuelType} ✓</span>` : '';
+}
+function hoursBadgeHtml(openStr) { return is247(openStr) ? '<span class="badge hours">24/7</span>' : ''; }
+
+function render(stops, totalKm, route, finalLegDurationS, stopFuel, reserve, fuelType) {
   say(`${mi(totalKm)} mi, ~${(route.duration / 3600).toFixed(1)} h driving — ${stops.length} fuel stop${stops.length === 1 ? '' : 's'}.`);
   stops.forEach((s, i) => {
     L.marker([s.lat, s.lon]).addTo(drawn)
@@ -1883,7 +2013,7 @@ function render(stops, totalKm, route, finalLegDurationS, stopFuel, reserve) {
     const f = stopFuel[i];
     const low = f.pct <= reserve * 100;
     $('stops').insertAdjacentHTML('beforeend', `<li>
-      <div class="name"><span class="n">${i + 1}</span>${s.name}${s.forced ? ' <span class="meta">(your required stop)</span>' : ''}</div>
+      <div class="name"><span class="n">${i + 1}</span>${s.name}${s.forced ? ' <span class="meta">(your required stop)</span>' : ''}${fuelBadgeHtml(s, fuelType)}${hoursBadgeHtml(s.open)}</div>
       <div class="meta">mile ${mi(s.realKm)} · ${mi(s.realLeg)} mi / ${fmtDuration(s.legDurationS)} since last fill · ${(s.detour * 1000 / KM_PER_MI / 1000).toFixed(1)} mi off route
         · arrive with ≈ ${f.gal.toFixed(1)} gal (${f.pct.toFixed(0)}%)
         ${s.open ? '· ' + s.open : ''}
@@ -2468,6 +2598,37 @@ if (new URLSearchParams(location.search).get('test')) {
   ok(insertedObjs[2].refuel === true && insertedObjs[2].radiusMi === 12,
     `insertWaypoint shifts the flagged waypoint without disturbing its data: ${JSON.stringify(insertedObjs[2])}`);
 
+  // Reverse trip: swaps origin/destination, reverses the middle, and the refuel flag/radius
+  // travel with their waypoint (plain array reverse — the flag lives on the object, not a
+  // parallel list, same as moveWaypoint/insertWaypoint above).
+  const reversedOnce = reverseTrip(wpObjs);
+  ok(reversedOnce[0].text === 'Black Rock City, NV' && reversedOnce[2].text === 'Lakewood, CO',
+    `reverseTrip swaps origin and destination: ${reversedOnce.map(w => w.text).join(' -> ')}`);
+  ok(reversedOnce[1].refuel === true && reversedOnce[1].radiusMi === 12,
+    `reverseTrip carries the refuel flag/radius with its waypoint, not left behind at the old index: ${JSON.stringify(reversedOnce[1])}`);
+  const reversedTwice = reverseTrip(reversedOnce);
+  ok(JSON.stringify(reversedTwice) === JSON.stringify(wpObjs), 'reversing a trip twice restores the exact original waypoint list');
+
+  // Share trip by URL: encode/decode round-trips a full payload (waypoints incl. refuel/radius,
+  // vehicle incl. the `ed` edited-flag, and the rest of the planning inputs) unchanged.
+  const samplePayload = {
+    wp: [mkWaypoint('Denver, CO'), { ...mkWaypoint('Fernley, NV'), refuel: true, radiusMi: 12 }, mkWaypoint('Reno, NV')],
+    v: { y: '2020', mk: 'Toyota', md: 'Camry', tr: '12345', mpg: '32', gal: '14', ed: true },
+    fuel: '90', reserve: '15', price: '3.75', over: '5', windBasis: 'live', windDate: '',
+  };
+  const roundTripped = decodeTripHash('#' + hashFromPayload(samplePayload));
+  ok(JSON.stringify(roundTripped) === JSON.stringify(samplePayload),
+    `trip hash round-trips through encode/decode unchanged: ${JSON.stringify(roundTripped)}`);
+
+  // Malformed/garbage hash must decode to null (never throw) so the caller falls straight through
+  // to localStorage exactly as if there were no hash — see restoreWaypoints/restoreVehicle above.
+  ok(decodeTripHash('#trip=%%%broken') === null, 'unparseable percent-encoding decodes to null, not a throw');
+  ok(decodeTripHash('#nonsense') === null, 'a hash with no trip= param decodes to null');
+  ok(decodeTripHash('') === null, 'an empty hash decodes to null');
+  ok(decodeTripHash('#trip=' + encodeURIComponent(JSON.stringify({ foo: 1 }))) === null,
+    'valid JSON missing a wp[] array decodes to null, not a half-restored trip');
+  ok(decodeTripHash('#trip=' + encodeURIComponent('null')) === null, 'JSON null decodes to null, not a crash on t.wp');
+
   // Requirement 1: dedup helpers used to keep a forced stop from doubling up with either
   // another forced stop or a station the general sweep found on its own (requirement 4).
   const twoCloseForced = [{ realKm: 500 }, { realKm: 500.5 }, { realKm: 900 }];
@@ -2515,6 +2676,48 @@ if (new URLSearchParams(location.search).get('test')) {
     `arrival at the forced stop, before the refill: 10gal - 60km/20 = ${withForced.stops[0].gal} gal`);
   ok(Math.abs(withForced.waypoints[0].gal - 8) < 1e-9,
     `waypoint after the forced stop refills first: full at km60, then (100-60)/20 burned = ${withForced.waypoints[0].gal} gal left`);
+
+  // Fuel type: the three-way yes/no/missing distinction (fuelTagValue) — the whole bug this
+  // feature exists to avoid is collapsing "no" and "missing" into one falsy check, so all three
+  // cases get their own assertion using real-shaped OSM tags (see the report for the live
+  // stations these came from: Girton Mart at 39.6553755,-105.1076898 tags fuel:diesel=no,
+  // fuel:e85=yes; Circle K way 344426471 tags fuel:diesel=yes, opening_hours=24/7).
+  const girtonTags = { 'fuel:diesel': 'no', 'fuel:e85': 'yes', opening_hours: 'Mo-Fr 06:00-21:00; Sa,Su 07:00-21:00' };
+  const circleKTags = { 'fuel:diesel': 'yes', opening_hours: '24/7' };
+  ok(fuelTagValue(girtonTags, 'diesel') === 'no', `explicit fuel:diesel=no reads as "no", got ${fuelTagValue(girtonTags, 'diesel')}`);
+  ok(fuelTagValue(girtonTags, 'e85') === 'yes', `explicit fuel:e85=yes reads as "yes", got ${fuelTagValue(girtonTags, 'e85')}`);
+  ok(fuelTagValue(circleKTags, 'e85') === null, `no fuel:e85 tag at all reads as unknown (null), not "no": got ${fuelTagValue(circleKTags, 'e85')}`);
+  ok(fuelTagValue({}, 'diesel') === null, 'a station with no tags at all reads as unknown for diesel, not "no"');
+  ok(fuelTagValue(girtonTags, 'gasoline') === null, 'gasoline has no OSM tag key at all — always reads as unknown');
+  ok(fuelTagValue({ 'fuel:diesel': 'sometimes' }, 'diesel') === null,
+    'a fuel:diesel value that is neither "yes" nor "no" is treated as unknown, not guessed');
+
+  // filterFuelType: "no" is the only exclusion; "yes" and "missing" both pass through untouched —
+  // a strict filter would wrongly hide the untagged station too (spotty OSM coverage, see the
+  // feature's own rationale).
+  const untagged = { name: 'untagged', tags: {} };
+  const dieselNo = { name: 'diesel-no', tags: { 'fuel:diesel': 'no' } };
+  const dieselYes = { name: 'diesel-yes', tags: { 'fuel:diesel': 'yes' } };
+  const filtered = filterFuelType([untagged, dieselNo, dieselYes], 'diesel');
+  ok(filtered.length === 2 && filtered.every(s => s.name !== 'diesel-no'),
+    `only the explicit "no" station is excluded, untagged and "yes" both stay: ${filtered.map(s => s.name)}`);
+  ok(filterFuelType([untagged, dieselNo, dieselYes], 'gasoline').length === 3,
+    'gasoline (no tag key) excludes nothing at all');
+
+  // 24/7 detection: exact literal token only — this is a raw-string display, not a parser (see
+  // is247's own ponytail comment), so anything else just shows as text with no badge.
+  ok(is247('24/7'), 'literal "24/7" is detected');
+  ok(!is247('Mo-Fr 06:00-21:00; Sa,Su 07:00-21:00'), 'a real weekly schedule is not mistaken for 24/7');
+  ok(!is247('Mo-Su 00:00-24:00'), 'an equivalent-but-different-syntax schedule is NOT parsed as 24/7 — raw-string only, by design');
+  ok(!is247('') && !is247(undefined) && !is247(null), 'empty/missing opening_hours never shows a 24/7 badge');
+
+  // Photon fallback: no tags at all (tags:{}), so both badge helpers must degrade to nothing —
+  // no "unknown" spam, no thrown error from a missing tags object.
+  const photonStation = { name: 'photon-station', open: '', tags: {} };
+  ok(fuelBadgeHtml(photonStation, 'diesel') === '', 'a Photon-sourced station renders no fuel badge for diesel');
+  ok(fuelBadgeHtml(photonStation, 'e85') === '', 'a Photon-sourced station renders no fuel badge for e85');
+  ok(hoursBadgeHtml(photonStation.open) === '', 'a Photon-sourced station renders no 24/7 badge (open is always "")');
+  ok(filterFuelType([photonStation], 'diesel').length === 1, 'a Photon-sourced station is never excluded by fuel type — unknown, not "no"');
 
   mapConcurrentCheck.then(() => {
     console.log('%call self checks passed', 'color:green;font-weight:bold');
