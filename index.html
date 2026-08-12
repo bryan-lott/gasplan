@@ -163,12 +163,15 @@ const OVERPASS_ENDPOINTS = ['https://maps.mail.ru/osm/tools/overpass/api/interpr
                             'https://overpass-api.de/api/interpreter'];
 
 // --- route corridor discovery -----------------------------------------------
-// ponytail: no keyless API gives "N maximally distinct corridors", so this fires extra via-routes
-// through points offset perpendicular to the origin-destination line and de-dupes the survivors.
-// Verified failure mode: an offset can land in water/mountains/nowhere-routable — handled by
-// discarding routes that fail to fetch or come back absurdly long, not by smarter placement.
-const OFFSET_KM = 200;         // perpendicular offset distance, middle of the verified 150-250km range
-const OFFSET_FRACS = [1 / 3, 2 / 3]; // how far along the origin-destination line to plant the offset
+// OSRM's alternatives=true only works on a plain 2-coordinate request (verified via curl: a 3rd
+// coordinate makes it silently ignore the flag and return exactly one route). For 2 waypoints
+// that request IS the whole trip (fetchAlternatives). For 3+ waypoints, ask it for the longest
+// leg alone (still 2 coordinates, see discoverCandidatesChain) and anchor a via-point at each
+// real alternative's own midpoint — every anchor sits on a road OSRM itself proposed.
+// Previously this offset a synthetic point perpendicular to the longest leg instead; that
+// fabricated corridors OSRM never suggested (one landed 0.2km from Moab UT on a Lakewood CO ->
+// Fernley NV leg — a 300mi detour rendered as a normal alternate) and relied on ABSURD_MULT alone
+// to catch it. Deleted (perpOffsetPoint/OFFSET_KM/OFFSET_FRACS) in favor of real anchors.
 const ABSURD_MULT = 1.5;       // candidates over 1.5x the shortest survivor's distance are discarded
 const DEDUPE_KM = 150;         // corridors within this + a shared dominant ref count as duplicates
 
@@ -469,24 +472,6 @@ function project(station, pts, cum) {
   return { km: cum[bestI], detour: best };
 }
 
-// Point `km` from `pt` along compass bearing `bearingDeg` (standard great-circle destination formula).
-function destPoint(pt, bearingDeg, km) {
-  const R = 6371, rad = Math.PI / 180;
-  const lat1 = pt[0] * rad, lon1 = pt[1] * rad, brg = bearingDeg * rad, d = km / R;
-  const lat2 = Math.asin(Math.sin(lat1) * Math.cos(d) + Math.cos(lat1) * Math.sin(d) * Math.cos(brg));
-  const lon2 = lon1 + Math.atan2(Math.sin(brg) * Math.sin(d) * Math.cos(lat1),
-                                  Math.cos(d) - Math.sin(lat1) * Math.sin(lat2));
-  return [lat2 / rad, ((lon2 / rad) + 540) % 360 - 180];
-}
-
-// A point `km` off to one `side` (+1/-1) of the a->b line, `frac` of the way along it.
-// ponytail: linear lat/lon interpolation for the "along the line" point, not a true great-circle
-// fraction — fine at the few-hundred-km offsets this feeds into, upgrade to slerp if trips go global.
-function perpOffsetPoint(a, b, frac, km, side) {
-  const base = [a[0] + (b[0] - a[0]) * frac, a[1] + (b[1] - a[1]) * frac];
-  return destPoint(base, bearing(a, b) + 90 * side, km);
-}
-
 // --- route corridors: labeling & de-dup (pure) ------------------------------
 
 function routeSteps(route) { return (route.legs || []).flatMap(l => l.steps || []); }
@@ -522,24 +507,28 @@ function labelRoute(steps) {
   return refs.length ? 'via ' + refs.join(' / ') : 'via unnamed roads';
 }
 
-// Distance-weighted refs beyond labelRoute's top-2 — casts a wider net so a road where two
-// corridors actually diverge (often buried below the shared trunk by distance — I-80 dominates
-// every northern option between Lakewood CO and Black Rock City NV) is available to break a
-// label collision.
+// Distance-weighted refs beyond labelRoute's top-2 — casts a wider net so a road where a
+// corridor actually diverges from the rest (often buried below a dominant shared trunk by
+// distance — I-80 dominates every northern option between Lakewood CO and Black Rock City NV,
+// and can also bury the one ref, e.g. US-191, that makes a corridor an outlier) is available.
 function candidateRefs(route) { return topRefs(routeSteps(route), 8).map(([r]) => r); }
 
-// Corridors sharing a dominant trunk get identical labelRoute() labels even when they're
-// genuinely different paths (verified: Lakewood CO -> Black Rock City NV produces two "via I-80 /
-// I-25" options 969mi/1010mi that diverge on US-191). Re-label any pair that collides using a ref
-// where they differ; fall back to appending distance if no ref distinguishes them at all — the
-// panel must never show two options a user can't tell apart.
+// labelRoute's plain top-2 label is distance-weighted, so a trunk every candidate shares (I-80)
+// can fill both slots and crowd out the one ref that actually sets a corridor apart — two
+// corridors then get identical labels (verified: Lakewood CO -> Black Rock City NV produces two
+// "via I-80 / I-25" options 969mi/1010mi that diverge on US-191), or a corridor's label just
+// looks like a normal alternate when it isn't. Re-label every candidate against every other kept
+// candidate's wider ref set (candidateRefs): a ref this route has that no other kept route has
+// wins the "divergent" slot; a ref it shares with at least one other keeps the "shared" slot.
+// Falls back to appending distance if literally nothing distinguishes them — the panel must
+// never show two options a user can't tell apart. With only one candidate there's nothing to
+// diverge from, so it keeps labelRoute's plain top-2 label unchanged.
 function labelCandidates(kept) {
   const labels = kept.map(c => labelRoute(routeSteps(c.route)));
+  if (kept.length < 2) return labels;
   const refs = kept.map(c => candidateRefs(c.route));
   return kept.map((c, i) => {
-    const clashes = kept.map((_, j) => j).filter(j => j !== i && labels[j] === labels[i]);
-    if (!clashes.length) return labels[i];
-    const otherRefs = new Set(clashes.flatMap(j => refs[j]));
+    const otherRefs = new Set(refs.filter((_, j) => j !== i).flat());
     const divergent = refs[i].find(r => !otherRefs.has(r));
     if (!divergent) return `${labels[i]} (${Math.round(c.route.distance / 1000)} km)`;
     const shared = refs[i].find(r => otherRefs.has(r));
@@ -701,20 +690,13 @@ async function fetchAlternatives(a, b) {
   }
 }
 
-// Up to 3 distinct corridors between two points: OSRM's own alternatives (at most 2, and only
-// for a 2-coordinate request) plus via-routes through perpendicular offset points (see the
-// OFFSET_* constants). All discovery calls use overview=false — full geometry is fetched only
-// for whichever option the user actually picks (see planCandidate).
-async function discoverCandidates(a, b) {
-  const av = [a.lat, a.lon], bv = [b.lat, b.lon];
-  const offsetCalls = OFFSET_FRACS.flatMap(frac => [1, -1].map(side => {
-    const [lat, lon] = perpOffsetPoint(av, bv, frac, OFFSET_KM, side);
-    const via = { lat, lon };
-    return fetchRoute([a, via, b], { overview: 'false' })
-      .then(routes => [{ route: routes[0], coords: [a, via, b] }]).catch(() => []);
-  }));
-  const [alt, ...offsets] = await Promise.all([fetchAlternatives(a, b), ...offsetCalls]);
-  const all = [alt, ...offsets].flat().sort((x, y) => x.route.distance - y.route.distance);
+// Reduce a list of { route, coords } candidates to up to 3 kept, labeled corridors: shortest
+// first, drop anything over ABSURD_MULT x the shortest, drop duplicates (isDuplicateCorridor).
+// Pure — shared tail of discoverCandidates and discoverCandidatesChain, both of which differ only
+// in how they gather `all`. With a single candidate (no real alternatives found) this correctly
+// returns exactly that one corridor — the honest result, not a fabricated second option.
+function keepAndLabel(all) {
+  all = [...all].sort((x, y) => x.route.distance - y.route.distance);
   if (!all.length) return [];
   const shortest = all[0].route.distance;
   const kept = [];
@@ -727,6 +709,14 @@ async function discoverCandidates(a, b) {
   }
   const labels = labelCandidates(kept);
   return kept.map((c, i) => ({ ...c, label: labels[i] }));
+}
+
+// Up to 3 distinct corridors between two points, straight from OSRM's own alternatives=true
+// (fetchAlternatives) — a plain 2-coordinate request is exactly the case that flag works for, so
+// there's nothing to invent. overview=false — full geometry is fetched only for whichever option
+// the user actually picks (see planCandidate).
+async function discoverCandidates(a, b) {
+  return keepAndLabel(await fetchAlternatives(a, b));
 }
 
 // Longest leg in an ordered waypoint chain (index i of pts[i] -> pts[i+1], by haversine) — the
@@ -755,40 +745,33 @@ function insertAnchor(pts, legIdx, anchor) {
 
 // Corridor discovery for 3+ waypoints. discoverCandidates(a, b) only handles the plain two-point
 // case (OSRM's alternatives=true is silently ignored once a 3rd coordinate is in the request,
-// verified via curl — that's the whole reason this function exists), so this reuses the same
-// perpendicular-offset via-route trick aimed at the longest leg (see longestLegIndex) plus the
-// straight-through route as a baseline, then de-dupes/labels with the exact same machinery
-// discoverCandidates uses. Same discovery cost shape: overview=false, full geometry fetched only
-// for whatever the user picks (see planCandidate).
-// ponytail: doesn't also stitch per-leg alternatives=true results back in — that's a
-// combinatorial blow-up (each leg's alternatives x every other leg) for corridors the offset
-// sweep already covers on the leg that actually has room to differ. Add per-leg stitching if a
-// trip is ever found that needs a 4th distinct option this sweep can't reach.
+// verified via curl — that's the whole reason this function exists), so this asks for real
+// alternatives on just the longest leg (see longestLegIndex — the one stretch with room for a
+// different road once the other waypoints are already fixed), then anchors a via-point at each
+// additional alternative's own midpoint (corridorMidpoint, read off its actual geometry — nothing
+// invented) and re-routes the full chain through it. legAlts[0] is the same corridor as the
+// straight-through route on this leg, so only the extras (legAlts.slice(1)) cost a full-trip
+// request. If OSRM has nothing else to offer for that leg, this returns just the straight-through
+// route — one honest corridor, not a fabricated second one.
+// ponytail: doesn't also stitch per-leg alternatives=true results back in for every other leg —
+// that's a combinatorial blow-up for corridors the longest leg already covers. Add per-leg
+// stitching if a trip is ever found that needs a distinct option this can't reach.
 async function discoverCandidatesChain(pts) {
-  const straight = fetchRoute(pts, { overview: 'false' })
-    .then(routes => [{ route: routes[0], coords: pts }]).catch(() => []);
   const legIdx = longestLegIndex(pts);
-  const av = [pts[legIdx].lat, pts[legIdx].lon], bv = [pts[legIdx + 1].lat, pts[legIdx + 1].lon];
-  const offsetCalls = OFFSET_FRACS.flatMap(frac => [1, -1].map(side => {
-    const [lat, lon] = perpOffsetPoint(av, bv, frac, OFFSET_KM, side);
-    const coords = insertAnchor(pts, legIdx, { lat, lon });
+  const [a, b] = [pts[legIdx], pts[legIdx + 1]];
+  const [straight, legAlts] = await Promise.all([
+    fetchRoute(pts, { overview: 'false' }).then(routes => [{ route: routes[0], coords: pts }]).catch(() => []),
+    fetchAlternatives(a, b),
+  ]);
+  const extraCalls = legAlts.slice(1).map(alt => {
+    const anchor = corridorMidpoint(routeSteps(alt.route));
+    if (!anchor) return Promise.resolve([]);
+    const coords = insertAnchor(pts, legIdx, { lat: anchor[0], lon: anchor[1] });
     return fetchRoute(coords, { overview: 'false' })
       .then(routes => [{ route: routes[0], coords }]).catch(() => []);
-  }));
-  const [str, ...offsets] = await Promise.all([straight, ...offsetCalls]);
-  const all = [str, ...offsets].flat().sort((x, y) => x.route.distance - y.route.distance);
-  if (!all.length) return [];
-  const shortest = all[0].route.distance;
-  const kept = [];
-  for (const c of all) {
-    if (c.route.distance > shortest * ABSURD_MULT) continue;
-    const sig = corridorSignature(c.route);
-    if (kept.some(k => isDuplicateCorridor(k.sig, sig))) continue;
-    kept.push({ ...c, sig });
-    if (kept.length === 3) break;
-  }
-  const labels = labelCandidates(kept);
-  return kept.map((c, i) => ({ ...c, label: labels[i] }));
+  });
+  const extras = await Promise.all(extraCalls);
+  return keepAndLabel([straight, ...extras].flat());
 }
 
 // Corridor discovery, cached on the full ordered waypoint-coordinate tuple — a replanned route
@@ -804,10 +787,10 @@ async function discoverCandidatesChain(pts) {
 // re-discover — only a genuinely unchanged, same-order waypoint list hits.
 function discoveryCacheKey(pts) { return pts.map(p => coordKey([p.lat, p.lon])).join(';'); }
 const discoveryCache = new Map();
-// Two waypoints: OSRM's own alternatives=true plus perpendicular offset via-routes (see
-// discoverCandidates). 3+ waypoints: alternatives=true is silently ignored past 2 coordinates, so
-// discoverCandidatesChain keeps every user waypoint fixed & in order and hunts for an alternate
-// corridor only within the longest leg (see longestLegIndex).
+// Two waypoints: OSRM's own alternatives=true, directly (see discoverCandidates). 3+ waypoints:
+// alternatives=true is silently ignored past 2 coordinates, so discoverCandidatesChain keeps
+// every user waypoint fixed & in order and hunts for real alternatives only within the longest
+// leg (see longestLegIndex), anchored on their own geometry (see corridorMidpoint).
 async function discoverCandidatesFor(pts) {
   const cacheKey = discoveryCacheKey(pts);
   if (discoveryCache.has(cacheKey)) return discoveryCache.get(cacheKey);
@@ -1691,7 +1674,7 @@ async function run() {
     // Forced ("refuel here") stops: only an intermediate waypoint qualifies (not the start,
     // not the final destination — see renderWaypoints), carried alongside its geocoded
     // lat/lon/label so planCandidate never has to re-match it against candidate.coords (which
-    // may include a synthetic corridor-discovery anchor point — see discoverCandidatesChain).
+    // may include a corridor-discovery anchor point that isn't a user waypoint — see discoverCandidatesChain).
     const forcedWps = pts0.map((p, i) => ({ ...p, refuel: activeWps[i].refuel, radiusMi: activeWps[i].radiusMi }))
       .filter((w, i) => i > 0 && i < pts0.length - 1 && w.refuel);
 
@@ -2297,16 +2280,31 @@ if (new URLSearchParams(location.search).get('test')) {
   ok(!isDuplicateCorridor(north1, west), 'I-25/I-80 vs I-70/US-50 is not a duplicate');
   ok(!isDuplicateCorridor(north1, farNorth), 'same refs but far-apart midpoints is not a duplicate');
 
-  // Perpendicular offset: lands ~OFFSET_KM from the a->b line, roughly 90 degrees off its bearing.
-  const oa = [39.7, -105.0], ob = [40.9, -114.9]; // Lakewood-ish -> Reno-ish
-  const base = [(oa[0] + ob[0]) / 2, (oa[1] + ob[1]) / 2];
-  const off = perpOffsetPoint(oa, ob, 0.5, 200, 1);
-  const offDist = haversine(base, off);
-  ok(Math.abs(offDist - 200) < 5, `perpOffsetPoint lands ~200km from the baseline point, got ${offDist.toFixed(1)}`);
-  const diff = ((bearing(base, off) - bearing(oa, ob) + 540) % 360) - 180;
-  ok(Math.abs(Math.abs(diff) - 90) < 2, `offset direction is ~perpendicular to the route bearing, diff=${diff.toFixed(1)}`);
-  const offOtherSide = perpOffsetPoint(oa, ob, 0.5, 200, -1);
-  ok(haversine(off, offOtherSide) > 300, 'opposite side lands on the other side of the line');
+  // corridorMidpoint: the step nearest the route's halfway point by cumulative distance, not the
+  // geographic midpoint of start/end — this is what discoverCandidatesChain now reads an anchor
+  // off of, so it must land on the route's own geometry, not some derived point.
+  const midSteps = [
+    { distance: 100000, maneuver: { location: [-105, 40] } }, // [lon,lat]
+    { distance: 100000, maneuver: { location: [-106, 41] } }, // halfway (150km) falls here
+    { distance: 100000, maneuver: { location: [-107, 42] } },
+  ];
+  const mid = corridorMidpoint(midSteps);
+  ok(mid[0] === 41 && mid[1] === -106, `corridorMidpoint picks the step at the halfway mark: ${mid}`);
+  ok(corridorMidpoint([{ distance: 100 }]) === null, 'a step with no maneuver returns null, not a crash');
+
+  // keepAndLabel: shared tail of discoverCandidates/discoverCandidatesChain. A single candidate
+  // (OSRM had no real alternatives for the leg, see discoverCandidatesChain) must survive as
+  // exactly one corridor with its plain label — the fix this bug needed is precisely that this
+  // must never fabricate a second option to fill the gap.
+  const soleRoute = { route: { distance: 500000, legs: [{ steps: [{ ref: 'I 80', distance: 500000 }] }] }, coords: [] };
+  const soleKept = keepAndLabel([soleRoute]);
+  ok(soleKept.length === 1, `no real alternatives -> exactly one corridor, got ${soleKept.length}`);
+  ok(soleKept[0].label === 'via I-80', `single corridor keeps its plain label: ${soleKept[0].label}`);
+  // A route over ABSURD_MULT x the shortest is still dropped — the guard that survives now that
+  // anchors are real instead of a synthetic offset that needed it as the primary defense.
+  const absurdRoute = { route: { distance: 500000 * ABSURD_MULT + 1, legs: [{ steps: [{ ref: 'US 6', distance: 1 }] }] }, coords: [] };
+  ok(keepAndLabel([soleRoute, absurdRoute]).length === 1,
+    'a route over ABSURD_MULT x the shortest survivor is dropped');
 
   // Multi-waypoint corridor discovery (longestLegIndex/insertAnchor): the reported trip,
   // Lakewood CO -> Fernley NV -> Black Rock City NV. The long leg (Lakewood->Fernley, ~1500km)
@@ -2322,6 +2320,13 @@ if (new URLSearchParams(location.search).get('test')) {
   ok(withAnchor[0] === lakewood && withAnchor[2] === fernley && withAnchor[3] === brc,
     'every user waypoint stays present and in order, anchor spliced into the chosen leg only');
   ok(withAnchor[1].lat === 41 && withAnchor[1].lon === -112, 'anchor lands at the requested point');
+  // Anchor derivation (discoverCandidatesChain): a real alternative's own midpoint (corridorMidpoint,
+  // tested above) becomes the via-point spliced into the full chain (insertAnchor) — composing
+  // those two already-tested pure functions is the entire "new anchor" logic, so nothing here is
+  // invented off the a->b line the way the deleted perpOffsetPoint was.
+  const anchoredChain = insertAnchor(tripPts, legI, { lat: mid[0], lon: mid[1] });
+  ok(anchoredChain[1].lat === 41 && anchoredChain[1].lon === -106,
+    "the anchor spliced into the chain is exactly the alternative route's own midpoint");
   // A trip where the *last* leg is longest must still be found, not just index 0 by default.
   ok(longestLegIndex([lakewood, { lat: 39.75, lon: -105.3 }, brc]) === 1,
     `longest leg can be the last leg too, got ${longestLegIndex([lakewood, { lat: 39.75, lon: -105.3 }, brc])}`);
