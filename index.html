@@ -168,12 +168,39 @@ const OVERPASS_ENDPOINTS = ['https://maps.mail.ru/osm/tools/overpass/api/interpr
 // that request IS the whole trip (fetchAlternatives). For 3+ waypoints, ask it for the longest
 // leg alone (still 2 coordinates, see discoverCandidatesChain) and anchor a via-point at each
 // real alternative's own midpoint — every anchor sits on a road OSRM itself proposed.
-// Previously this offset a synthetic point perpendicular to the longest leg instead; that
-// fabricated corridors OSRM never suggested (one landed 0.2km from Moab UT on a Lakewood CO ->
-// Fernley NV leg — a 300mi detour rendered as a normal alternate) and relied on ABSURD_MULT alone
-// to catch it. Deleted (perpOffsetPoint/OFFSET_KM/OFFSET_FRACS) in favor of real anchors.
+//
+// That real-alternatives path genuinely comes up empty sometimes: OSRM returns exactly one route
+// for Lakewood CO -> Fernley NV at alternatives=true|2|3 (5 errors TooBig outright), even though a
+// real corridor exists (I-70/US-6 via Price UT). This used to be patched by offsetting a synthetic
+// point perpendicular to the longest leg; that fabricated corridors OSRM never suggested (one
+// landed 0.2km from Moab UT — a 300mi out-and-back spur rendered as a normal alternate) and relied
+// on ABSURD_MULT alone to catch it, which it didn't. Deleted in 422dbf3.
+//
+// Reinstated below (ANCHOR_OFFSETS_KM/ANCHOR_FRACTIONS, anchorProbeCandidates) but only as a
+// fallback: run once the real-alternatives path above has produced fewer than 2 distinct corridors
+// (needsAnchorProbe), and every candidate it produces goes through the self-overlap gate
+// (selfOverlapPct) before being kept — the Moab spur retraces 23.15% of its own route; every real
+// alternative measured across three test legs stayed at or under 2.21% (see SELF_OVERLAP_MAX_PCT).
+// ABSURD_MULT alone was not a strong enough gate; this is in addition to it, not instead of it.
 const ABSURD_MULT = 1.5;       // candidates over 1.5x the shortest survivor's distance are discarded
 const DEDUPE_KM = 150;         // corridors within this + a shared dominant ref count as duplicates
+
+// Anchor probe grid — only reached when needsAnchorProbe says the real-alternatives path came up
+// short, so most trips never pay for this. ponytail: calibrated against three real legs (Lakewood
+// CO -> Fernley NV, Denver -> Chicago, NYC -> Atlanta; raw probe data in
+// /Users/blott/.claude/jobs/c7fb3204/tmp/anchors/). Offset 0 at fraction 0.4 surfaces the wanted
+// Price UT corridor; Denver -> Chicago's real alternate needed roughly -100 to -200km. This grid
+// is the knob to widen if a real corridor is ever still missed — not derived truth.
+const ANCHOR_OFFSETS_KM = [0, -150, 150];
+const ANCHOR_FRACTIONS = [0.4, 0.6];
+// Self-overlap gate (selfOverlapPct): reject an anchored candidate that retraces more than this
+// fraction of its own route distance. Measured margin — fabricated Moab spur: 23.15%; every real
+// alternative across three test legs: <=2.21%. 5% sits ~10x above the real ceiling, ~4x below the
+// spur.
+const SELF_OVERLAP_MAX_PCT = 5;
+const SELF_OVERLAP_CELL_KM = 2;  // grid-cell size used to bucket route points for the overlap scan
+const SELF_OVERLAP_FAR_KM = 50;  // same cell revisited this far apart (cumulative route distance)
+                                  // counts as a real backtrack, not an ordinary wiggle or u-turn cusp
 
 // --- fuel-economy adjustment coefficients -----------------------------------
 // Named and grouped here so they're tunable without hunting through the logic below.
@@ -486,20 +513,85 @@ function pointsFromSteps(route) {
   return pts.length ? pts : null;
 }
 
-// OSRM refs look like "I 70", "US 6; US 191" (take the first), "49" (bare number/county road).
-function normalizeRef(ref) { return ref.split(';')[0].trim().replace(/ /g, '-'); }
+// Fraction (0-100) of a route's own distance that retraces itself: bucket points into
+// ~SELF_OVERLAP_CELL_KM grid cells (locally-projected around the route's own latitude so cells
+// are ~square), and count any cell visited more than once at cumulative-distance positions over
+// SELF_OVERLAP_FAR_KM apart as overlap — a close-together revisit is just consecutive points or a
+// short wiggle/u-turn cusp, not a real backtrack. See SELF_OVERLAP_MAX_PCT for the measured gap
+// this is meant to catch (23.15% fabricated spur vs <=2.21% real alternatives).
+function selfOverlapPct(pts) {
+  if (pts.length < 2) return 0;
+  const latRef = pts[0][0], rad = Math.PI / 180;
+  const kmPerLon = 6371 * Math.cos(latRef * rad) * rad, kmPerLat = 6371 * rad;
+  const cum = cumulate(pts);
+  const total = cum[cum.length - 1];
+  if (total === 0) return 0;
+  const byCell = new Map();
+  for (let i = 1; i < pts.length; i++) {
+    const midLat = (pts[i - 1][0] + pts[i][0]) / 2, midLon = (pts[i - 1][1] + pts[i][1]) / 2;
+    const key = Math.floor(midLon * kmPerLon / SELF_OVERLAP_CELL_KM) + ',' +
+                Math.floor(midLat * kmPerLat / SELF_OVERLAP_CELL_KM);
+    const cumMid = (cum[i - 1] + cum[i]) / 2, len = cum[i] - cum[i - 1];
+    if (!byCell.has(key)) byCell.set(key, []);
+    byCell.get(key).push({ cumMid, len });
+  }
+  let overlapKm = 0;
+  for (const list of byCell.values()) {
+    if (list.length < 2) continue;
+    const cums = list.map(s => s.cumMid);
+    if (Math.max(...cums) - Math.min(...cums) > SELF_OVERLAP_FAR_KM) overlapKm += list.reduce((a, s) => a + s.len, 0);
+  }
+  return 100 * overlapKm / total;
+}
+// The gate as a plain threshold comparison, split out so it's testable without a network call.
+function passesOverlapGate(overlapPct) { return overlapPct <= SELF_OVERLAP_MAX_PCT; }
+
+// OSRM refs look like "I 70", "US 6; US 191" (a concurrency — both refs run the same pavement
+// for that step, so each gets the step's full distance, not half), "49" (bare number/county
+// road), "US 6 BUS" (a business-route banner on US 6 — folds onto the parent so its mileage
+// accumulates there instead of fragmenting off into its own one-mile-long ref).
+// A banner token only folds when it trails a genuine parent route designation (class letters +
+// number, e.g. "US 6", "I 70" — ROUTE_CLASS) or is the ref's *only* token (nothing to fold onto,
+// nothing left to name a route). A banner leading a ref that has its own number ("BUS 71",
+// "Loop 410" — a real San Antonio road) names its own route and must survive intact, not collapse
+// into an unrelated plain route.
+const REF_BANNERS = /^(BUS|ALT|SPUR|TRUCK|BYP|LOOP)$/i;
+const ROUTE_CLASS = /^[A-Z]{1,3}$/i;
+function normalizeRef(ref) {
+  const tokens = ref.trim().split(/\s+/);
+  const hasParent = tokens.length > 2 && ROUTE_CLASS.test(tokens[0]) && /^\d+$/.test(tokens[1]);
+  return tokens.filter((t, i) => {
+    if (!REF_BANNERS.test(t)) return true;
+    if (tokens.length === 1) return false; // solo banner: no parent, nothing to name a route
+    return !(hasParent && i >= 2); // keep unless trailing a real class+number parent
+  }).join('-');
+}
+function splitRefs(ref) { return ref.split(';').map(normalizeRef).filter(Boolean); }
 function isMajorRef(ref) { return /^(I|US)-/.test(ref); }
+
+// ponytail: a ref must carry at least this share of the route's total ref-bearing distance to be
+// eligible for a label slot — otherwise a mile-long spur/ramp ref can outrank the roads that
+// actually define the corridor. Fraction rather than absolute miles so it scales with trip
+// length; 3% clears real corridor legs (tens+ miles on a multi-hundred-mile trip) while dropping
+// spur-scale noise. Falls back to the unfiltered set if literally everything is under the floor
+// (a short local trip) so a route never loses its label entirely.
+const MIN_REF_SHARE = 0.03;
 
 // Distance-weighted road refs for a route, majors preferred over bare numbers when both appear.
 function topRefs(steps, n) {
   const totals = new Map();
+  let total = 0;
   for (const s of steps) {
     if (!s.ref) continue;
-    const r = normalizeRef(s.ref);
-    totals.set(r, (totals.get(r) || 0) + s.distance);
+    const refs = splitRefs(s.ref);
+    if (!refs.length) continue; // banner-only ref (e.g. "BUS") credits to no ref — keep it out of the denominator too
+    for (const r of refs) totals.set(r, (totals.get(r) || 0) + s.distance);
+    total += s.distance;
   }
   let entries = [...totals.entries()];
   if (entries.some(([r]) => isMajorRef(r))) entries = entries.filter(([r]) => isMajorRef(r));
+  const aboveFloor = entries.filter(([, d]) => d >= total * MIN_REF_SHARE);
+  if (aboveFloor.length) entries = aboveFloor;
   return entries.sort((a, b) => b[1] - a[1]).slice(0, n);
 }
 function labelRoute(steps) {
@@ -546,9 +638,17 @@ function corridorMidpoint(steps) {
   }
   return null;
 }
-function corridorSignature(route) {
+// midHint overrides the distance-based midpoint — needed for an anchor-probe candidate (see
+// anchorProbeCandidates), whose real fingerprint is the anchor itself, not wherever 50% of total
+// distance happens to land. A route that mostly shares its shortest survivor's road (e.g. an
+// anchored Price-UT detour that rejoins I-80 for most of the remaining miles) can have its 50%
+// point fall on the shared tail, landing on the exact same node as the corridor it's supposed to
+// be distinguished from — verified against the real Lakewood CO -> Fernley NV probe data (both
+// landed on 40.756337,-111.912037), which made a genuinely distinct corridor look like a duplicate
+// of the base route it diverges from.
+function corridorSignature(route, midHint) {
   const steps = routeSteps(route);
-  return { refs: topRefs(steps, 2).map(([r]) => r), mid: corridorMidpoint(steps) };
+  return { refs: topRefs(steps, 2).map(([r]) => r), mid: midHint || corridorMidpoint(steps) };
 }
 // Same corridor if they share a dominant ref AND pass through the same part of the map —
 // shared refs alone false-positive on routes that briefly overlap near shared endpoints.
@@ -694,7 +794,9 @@ async function fetchAlternatives(a, b) {
 // first, drop anything over ABSURD_MULT x the shortest, drop duplicates (isDuplicateCorridor).
 // Pure — shared tail of discoverCandidates and discoverCandidatesChain, both of which differ only
 // in how they gather `all`. With a single candidate (no real alternatives found) this correctly
-// returns exactly that one corridor — the honest result, not a fabricated second option.
+// returns exactly that one corridor — the honest result, not a fabricated second option. A
+// candidate carrying its own `anchorAt` (see anchorProbeCandidates) uses that as its dedup
+// fingerprint instead of the distance-based midpoint — see corridorSignature's comment.
 function keepAndLabel(all) {
   all = [...all].sort((x, y) => x.route.distance - y.route.distance);
   if (!all.length) return [];
@@ -702,7 +804,7 @@ function keepAndLabel(all) {
   const kept = [];
   for (const c of all) {
     if (c.route.distance > shortest * ABSURD_MULT) continue;
-    const sig = corridorSignature(c.route);
+    const sig = corridorSignature(c.route, c.anchorAt);
     if (kept.some(k => isDuplicateCorridor(k.sig, sig))) continue;
     kept.push({ ...c, sig });
     if (kept.length === 3) break;
@@ -713,10 +815,16 @@ function keepAndLabel(all) {
 
 // Up to 3 distinct corridors between two points, straight from OSRM's own alternatives=true
 // (fetchAlternatives) — a plain 2-coordinate request is exactly the case that flag works for, so
-// there's nothing to invent. overview=false — full geometry is fetched only for whichever option
-// the user actually picks (see planCandidate).
+// there's usually nothing to invent. overview=false — full geometry is fetched only for whichever
+// option the user actually picks (see planCandidate). Falls back to the anchor probe grid
+// (anchorProbeCandidates) only when that leaves fewer than 2 distinct corridors (needsAnchorProbe)
+// — see the comment above ABSURD_MULT for why and how that's gated.
 async function discoverCandidates(a, b) {
-  return keepAndLabel(await fetchAlternatives(a, b));
+  const raw = await fetchAlternatives(a, b);
+  const cheap = keepAndLabel(raw);
+  if (!needsAnchorProbe(cheap)) return cheap;
+  const anchored = await anchorProbeCandidates([a, b], 0);
+  return keepAndLabel([...raw, ...anchored]);
 }
 
 // Longest leg in an ordered waypoint chain (index i of pts[i] -> pts[i+1], by haversine) — the
@@ -743,6 +851,59 @@ function insertAnchor(pts, legIdx, anchor) {
   return [...pts.slice(0, legIdx + 1), anchor, ...pts.slice(legIdx + 1)];
 }
 
+// Perpendicular-offset anchor at fraction f along the straight line start->end (each {lat,lon}),
+// offset by offsetKm to one side. Local equirectangular projection around the leg's own midpoint
+// latitude — the same short-distance assumption haversine already makes. Offset sign is arbitrary
+// (the probe grid tries both, see ANCHOR_OFFSETS_KM) — unlike the deleted perpOffsetPoint, nothing
+// this produces is trusted on its own; every route built from it goes through selfOverlapPct.
+function anchorPoint(start, end, f, offsetKm) {
+  const latRef = (start.lat + end.lat) / 2, rad = Math.PI / 180;
+  const kmPerLon = 6371 * Math.cos(latRef * rad) * rad, kmPerLat = 6371 * rad;
+  const sx = start.lon * kmPerLon, sy = start.lat * kmPerLat;
+  const ex = end.lon * kmPerLon, ey = end.lat * kmPerLat;
+  const px = sx + f * (ex - sx), py = sy + f * (ey - sy);
+  const dx = ex - sx, dy = ey - sy, len = Math.hypot(dx, dy) || 1;
+  return { lat: (py + (dx / len) * offsetKm) / kmPerLat, lon: (px - (dy / len) * offsetKm) / kmPerLon };
+}
+
+// Fewer than 2 surviving corridors means the real-alternatives path (fetchAlternatives, and the
+// real-alternative-midpoint anchors in discoverCandidatesChain) came up short — see the anchor
+// probe grid comment above ABSURD_MULT. Pure so the gating decision is testable without a network
+// call.
+function needsAnchorProbe(kept) { return kept.length < 2; }
+
+// Perpendicular-offset probe grid for leg [legIdx, legIdx+1] of an ordered waypoint chain — the
+// fallback of last resort, only called when needsAnchorProbe says so. Every candidate is checked
+// with selfOverlapPct/passesOverlapGate before being kept; a route that fails is dropped silently,
+// same as a request that errors outright.
+async function anchorProbeCandidates(pts, legIdx) {
+  const a = pts[legIdx], b = pts[legIdx + 1];
+  const grid = ANCHOR_FRACTIONS.flatMap(f => ANCHOR_OFFSETS_KM.map(off => anchorPoint(a, b, f, off)));
+  // Same concurrency cap as Overpass (OVERPASS_CONCURRENCY) and the same reason: a free, no-SLA
+  // demo server, don't burst it.
+  const results = await mapConcurrent(grid, OVERPASS_CONCURRENCY, async anchor => {
+    const coords = insertAnchor(pts, legIdx, anchor);
+    try {
+      const [route] = await fetchRoute(coords, { overview: 'false' });
+      const geom = pointsFromSteps(route);
+      // No scoreable geometry means no self-overlap check ran — fail closed, not open: a route
+      // that can't be scored is exactly the case not to trust (see the Moab spur in the comment
+      // above ABSURD_MULT).
+      if (!geom || !passesOverlapGate(selfOverlapPct(geom))) return null;
+      // Snap the raw anchor (off-corridor by construction — up to ANCHOR_OFFSETS_KM, and the two
+      // ANCHOR_FRACTIONS probes sit ~0.2x leg-length apart) onto the route's own geometry, so two
+      // probes converging on the same real corridor land on nearby points of that shared geometry
+      // and dedup correctly in isDuplicateCorridor, instead of the raw inputs being too far apart
+      // to ever fall inside DEDUPE_KM (verified: multiple grid offsets converged on the same real
+      // road for Denver -> Chicago).
+      const cum = cumulate(geom);
+      const snapped = pointAt(geom, cum, project([anchor.lat, anchor.lon], geom, cum).km);
+      return { route, coords, anchorAt: snapped };
+    } catch { return null; }
+  });
+  return results.filter(Boolean);
+}
+
 // Corridor discovery for 3+ waypoints. discoverCandidates(a, b) only handles the plain two-point
 // case (OSRM's alternatives=true is silently ignored once a 3rd coordinate is in the request,
 // verified via curl — that's the whole reason this function exists), so this asks for real
@@ -752,7 +913,9 @@ function insertAnchor(pts, legIdx, anchor) {
 // invented) and re-routes the full chain through it. legAlts[0] is the same corridor as the
 // straight-through route on this leg, so only the extras (legAlts.slice(1)) cost a full-trip
 // request. If OSRM has nothing else to offer for that leg, this returns just the straight-through
-// route — one honest corridor, not a fabricated second one.
+// route — one honest corridor, not a fabricated second one. If that still leaves fewer than 2
+// distinct corridors (needsAnchorProbe), falls back to the perpendicular-offset anchor probe grid
+// on the same leg (anchorProbeCandidates) — see the comment above ABSURD_MULT.
 // ponytail: doesn't also stitch per-leg alternatives=true results back in for every other leg —
 // that's a combinatorial blow-up for corridors the longest leg already covers. Add per-leg
 // stitching if a trip is ever found that needs a distinct option this can't reach.
@@ -771,7 +934,11 @@ async function discoverCandidatesChain(pts) {
       .then(routes => [{ route: routes[0], coords }]).catch(() => []);
   });
   const extras = await Promise.all(extraCalls);
-  return keepAndLabel([straight, ...extras].flat());
+  const raw = [straight, ...extras].flat();
+  const cheap = keepAndLabel(raw);
+  if (!needsAnchorProbe(cheap)) return cheap;
+  const anchored = await anchorProbeCandidates(pts, legIdx);
+  return keepAndLabel([...raw, ...anchored]);
 }
 
 // Corridor discovery, cached on the full ordered waypoint-coordinate tuple — a replanned route
@@ -2261,14 +2428,51 @@ if (new URLSearchParams(location.search).get('test')) {
     'inserting a waypoint misses — a genuinely different trip');
 
   // Route labeling: distance-weighted refs, majors preferred over bare numbers, semicolon-joined
-  // refs keep only the first, internal spaces become hyphens.
+  // refs credit each constituent in full, banner suffixes fold onto the parent ref, internal
+  // spaces become hyphens.
   const stepsMajor = [{ ref: 'I 70', distance: 500000 }, { ref: 'US 50', distance: 100000 }, { ref: '49', distance: 5000 }];
   ok(labelRoute(stepsMajor) === 'via I-70 / US-50', `major refs win and sort by distance: ${labelRoute(stepsMajor)}`);
-  ok(labelRoute([{ ref: 'US 6; US 191', distance: 1000 }]) === 'via US-6', 'semicolon-joined ref keeps only the first');
+  ok(labelRoute([{ ref: 'US 6; US 191', distance: 1000 }]) === 'via US-6 / US-191',
+    'semicolon-joined ref credits each constituent, not the literal joined string');
   ok(labelRoute([{ ref: '49', distance: 1000 }]) === 'via 49', 'bare ref kept when no major ref exists');
   ok(labelRoute([{ ref: '49', distance: 1000 }, { ref: 'I 25', distance: 500 }]) === 'via I-25',
     'bare county ref dropped once a real interstate is present');
   ok(labelRoute([]) === 'via unnamed roads', 'no refs at all falls back to a plain label');
+  ok(labelRoute([{ ref: 'US 6 BUS', distance: 5000 }, { ref: 'US 6', distance: 500000 }]) === 'via US-6',
+    'a BUS banner variant folds onto its parent ref rather than fragmenting off');
+  ok(labelRoute([{ ref: 'I 70', distance: 335000 }, { ref: 'US 6', distance: 123000 },
+    { ref: 'I 15', distance: 50000 }, { ref: 'US 6 BUS', distance: 1000 }]) === 'via I-70 / US-6',
+    'a ~1mi BUS spur never displaces the parent route it should have folded into');
+  ok(topRefs([{ ref: 'I 80', distance: 480000 }, { ref: 'I 15', distance: 1000 }], 2).length === 1,
+    'a major ref under the MIN_REF_SHARE floor is dropped entirely, not just outranked');
+  const manyTinyRefs = Array.from({ length: 40 }, (_, i) => ({ ref: `R${i}`, distance: 1 }));
+  ok(topRefs(manyTinyRefs, 2).length === 2,
+    'when every ref is under the floor, topRefs falls back to the unfiltered set instead of returning nothing');
+
+  // MIN_REF_SHARE denominator (topRefs): a step whose ref is only a banner token (splitRefs
+  // strips it to nothing, see normalizeRef below) must not inflate the denominator legitimate
+  // refs are measured against — otherwise a real ref just above 3% of the real total gets pushed
+  // under the floor by phantom mass credited to no ref at all.
+  const bannerStep = { ref: 'BUS', distance: 970000 };
+  const majorStep = { ref: 'I 70', distance: 900000 };
+  const borderlineStep = { ref: 'US 6', distance: 30000 }; // 30000/930000 = 3.226% of the real total
+  const refsWithBanner = topRefs([bannerStep, majorStep, borderlineStep], 2).map(([r]) => r);
+  ok(refsWithBanner.includes('US-6'),
+    `a banner-only step's distance is excluded from the denominator, so a real ref just above 3% of the real total survives: ${JSON.stringify(refsWithBanner)}`);
+  const buggyShare = 30000 / (930000 + 970000); // what the share would be if the banner mass counted
+  ok(buggyShare < MIN_REF_SHARE,
+    `sanity: with the banner-only step's distance counted in the denominator, the same ref would have fallen under the floor — ${(buggyShare * 100).toFixed(2)}% < 3%`);
+
+  // normalizeRef: a banner only folds onto a genuine parent (class letters + number) ahead of it —
+  // a leading banner with no parent, even one that has its own number, names its own route and
+  // must survive intact.
+  ok(normalizeRef('Loop 410') === 'Loop-410',
+    `"Loop 410" (a real San Antonio road) is left intact, not stripped to a bare number: ${normalizeRef('Loop 410')}`);
+  ok(normalizeRef('BUS 71') === 'BUS-71',
+    `"BUS 71" is left intact, not collapsed into an unrelated plain route 71: ${normalizeRef('BUS 71')}`);
+  ok(normalizeRef('US 6 BUS') === 'US-6',
+    `a trailing banner after a genuine class+number parent folds onto it: ${normalizeRef('US 6 BUS')}`);
+  ok(normalizeRef('BUS') === '', 'a solo banner token with no parent and no number of its own strips to nothing');
 
   // Corridor de-dup: shared dominant refs AND a nearby midpoint = same corridor. The Lakewood ->
   // Black Rock City case: I-25/I-80 (north) vs I-70/US-50 (west) are genuinely distinct.
@@ -2292,6 +2496,19 @@ if (new URLSearchParams(location.search).get('test')) {
   ok(mid[0] === 41 && mid[1] === -106, `corridorMidpoint picks the step at the halfway mark: ${mid}`);
   ok(corridorMidpoint([{ distance: 100 }]) === null, 'a step with no maneuver returns null, not a crash');
 
+  // corridorSignature's midHint (anchorProbeCandidates' anchorAt): overrides the distance-based
+  // midpoint. Reproduces the real bug this fixed — a Lakewood CO -> Fernley NV anchor probe at
+  // f0.4/off0 (the wanted Price UT corridor, 1108mi) shares so much mileage with the base I-80/I-25
+  // route (1104mi) that both routes' 50%-by-distance points land on the exact same node
+  // (40.756337,-111.912037, taken from the real probe data), making corridorSignature call them
+  // duplicates without the hint even though they genuinely diverge via Price UT.
+  const sameSteps = midSteps; // any steps; midHint should win over corridorMidpoint(steps) regardless
+  const sigNoHint = corridorSignature({ legs: [{ steps: sameSteps }] });
+  ok(sigNoHint.mid[0] === 41 && sigNoHint.mid[1] === -106, 'without a hint, corridorSignature falls back to corridorMidpoint');
+  const sigWithHint = corridorSignature({ legs: [{ steps: sameSteps }] }, [39.6683, -110.7511]);
+  ok(sigWithHint.mid[0] === 39.6683 && sigWithHint.mid[1] === -110.7511,
+    `midHint overrides the distance-based midpoint: ${sigWithHint.mid}`);
+
   // keepAndLabel: shared tail of discoverCandidates/discoverCandidatesChain. A single candidate
   // (OSRM had no real alternatives for the leg, see discoverCandidatesChain) must survive as
   // exactly one corridor with its plain label — the fix this bug needed is precisely that this
@@ -2305,6 +2522,97 @@ if (new URLSearchParams(location.search).get('test')) {
   const absurdRoute = { route: { distance: 500000 * ABSURD_MULT + 1, legs: [{ steps: [{ ref: 'US 6', distance: 1 }] }] }, coords: [] };
   ok(keepAndLabel([soleRoute, absurdRoute]).length === 1,
     'a route over ABSURD_MULT x the shortest survivor is dropped');
+
+  // keepAndLabel + anchorAt: reproduces the real bug found while wiring up the anchor probe grid
+  // (real OSRM data, Lakewood CO -> Fernley NV). An anchored Price-UT candidate shares so much
+  // mileage with the base I-80/I-25 route that both routes' 50%-by-distance node is identical
+  // (40.756337,-111.912037) — without the anchorAt hint they wrongly dedupe to one corridor;
+  // with it (the anchor's own location, far enough from that shared node) both survive.
+  const sharedTailSteps = (ref) => [
+    { ref, distance: 500000, maneuver: { location: [-111.912037, 40.756337] } }, // [lon,lat]
+    { ref, distance: 500000 },
+  ];
+  const baseCorridor = { route: { distance: 1103950, legs: [{ steps: sharedTailSteps('I 80') }] }, coords: [] };
+  const anchoredNoHint = { route: { distance: 1108040, legs: [{ steps: sharedTailSteps('I 80') }] }, coords: [] };
+  const anchoredWithHint = { ...anchoredNoHint, anchorAt: [39.6683, -110.7511] };
+  ok(keepAndLabel([baseCorridor, anchoredNoHint]).length === 1,
+    'reproduces the bug: without anchorAt, the anchored candidate wrongly dedupes against the shared-tail base route');
+  ok(keepAndLabel([baseCorridor, anchoredWithHint]).length === 2,
+    'anchorAt fixes it: the anchored candidate survives as its own distinct corridor');
+
+  // Overlap gate fail-closed (anchorProbeCandidates): a route whose step geometry is empty/
+  // degenerate makes pointsFromSteps return null, so selfOverlapPct can't run at all. The gate
+  // must reject that candidate (fail CLOSED), not let it through ungated (fail open) — a route
+  // that can't be scored for self-overlap is exactly the case not to trust, per the Moab spur.
+  const noGeomRoute = { legs: [] };
+  const noGeom = pointsFromSteps(noGeomRoute);
+  ok(noGeom === null, 'sanity: a route with no step geometry at all produces null, not an empty array');
+  const gateRejects = !noGeom || !passesOverlapGate(selfOverlapPct(noGeom || []));
+  ok(gateRejects === true, 'the gate expression rejects a candidate whose geometry cannot be scored, instead of skipping the check');
+
+  // Snapped anchorAt (anchorProbeCandidates): the raw anchor is off-corridor by construction (up
+  // to ANCHOR_OFFSETS_KM=150 either side, ANCHOR_FRACTIONS probes ~0.2x leg-length apart), so
+  // snapping it onto the candidate's own returned geometry (cumulate/project/pointAt — the same
+  // helpers project() already uses) means two probes converging on the SAME real corridor land on
+  // nearby points of that shared geometry and dedup correctly, while a genuinely DIFFERENT
+  // corridor's own geometry stays far away and survives distinct.
+  const snapGeom = Array.from({ length: 101 }, (_, i) => [40, -115 + i * 0.1]); // one corridor: east-west line at lat 40
+  const snapCum = cumulate(snapGeom);
+  const snapToGeom = (geom, cum, raw) => pointAt(geom, cum, project(raw, geom, cum).km);
+  const rawAnchorNorth = [41.5, -110]; // ~167km north of the corridor
+  const rawAnchorSouth = [38.5, -110]; // ~167km south of it
+  ok(haversine(rawAnchorNorth, rawAnchorSouth) > DEDUPE_KM,
+    `sanity: the two raw anchors alone are farther apart than DEDUPE_KM — ${haversine(rawAnchorNorth, rawAnchorSouth).toFixed(0)}km`);
+  const snappedNorth = snapToGeom(snapGeom, snapCum, rawAnchorNorth);
+  const snappedSouth = snapToGeom(snapGeom, snapCum, rawAnchorSouth);
+  ok(haversine(snappedNorth, snappedSouth) < DEDUPE_KM,
+    `(a) two probes that converge on the same real corridor snap to nearby points on it: ${haversine(snappedNorth, snappedSouth).toFixed(1)}km apart`);
+  const sigSnapA = corridorSignature({ legs: [{ steps: sharedTailSteps('I 80') }] }, snappedNorth);
+  const sigSnapB = corridorSignature({ legs: [{ steps: sharedTailSteps('I 80') }] }, snappedSouth);
+  ok(isDuplicateCorridor(sigSnapA, sigSnapB), '(a) identical corridors collapse to one under the snapped midHint');
+
+  const otherGeom = Array.from({ length: 101 }, (_, i) => [45, -115 + i * 0.1]); // a different corridor entirely (stand-in for Price UT)
+  const otherCum = cumulate(otherGeom);
+  const snappedOther = snapToGeom(otherGeom, otherCum, [46, -110]);
+  ok(haversine(snappedNorth, snappedOther) >= DEDUPE_KM,
+    `(b) a genuinely distinct corridor's own geometry snaps far from the base corridor: ${haversine(snappedNorth, snappedOther).toFixed(0)}km`);
+  const sigSnapOther = corridorSignature({ legs: [{ steps: sharedTailSteps('I 80') }] }, snappedOther);
+  ok(!isDuplicateCorridor(sigSnapA, sigSnapOther), '(b) the distinct corridor is not merged with the base route, even sharing the same ref');
+
+  // Anchor probe gating (needsAnchorProbe): the pure decision of whether the real-alternatives
+  // path came up short enough to justify the anchor probe grid's extra OSRM calls — testable
+  // without a network call, and the thing that keeps a normal trip (2+ real corridors already
+  // found) from ever reaching the probe grid at all.
+  ok(needsAnchorProbe([]) === true, 'zero corridors needs the anchor probe');
+  ok(needsAnchorProbe([soleKept[0]]) === true, 'exactly one corridor still needs the anchor probe');
+  ok(needsAnchorProbe([soleKept[0], soleKept[0]]) === false, 'two corridors already found — no probe needed');
+  ok(needsAnchorProbe([soleKept[0], soleKept[0], soleKept[0]]) === false, 'three corridors — still no probe needed');
+
+  // Self-overlap gate: a synthetic out-and-back spur (go out along a line, come straight back over
+  // the same ground, then continue on) revisits its own path the way the fabricated Moab spur did;
+  // a synthetic straight line covering the same kind of distance never does. Hand-built geometry,
+  // no network — the mechanism selfOverlapPct/passesOverlapGate exists to catch.
+  const lineTo = (pts, fromLon, toLon, lat, n) => {
+    for (let i = 1; i <= n; i++) pts.push([lat, fromLon + (toLon - fromLon) * i / n]);
+  };
+  const spurPts = [[40, -106]];
+  lineTo(spurPts, -106, -104, 40, 40); // out ~170km
+  lineTo(spurPts, -104, -106, 40, 40); // straight back over the same ground
+  lineTo(spurPts, -106, -102, 40, 40); // then on toward the destination
+  const spurOverlap = selfOverlapPct(spurPts);
+  ok(spurOverlap > 20, `synthetic out-and-back spur shows heavy self-overlap: ${spurOverlap.toFixed(1)}%`);
+  ok(!passesOverlapGate(spurOverlap), 'the spur fails the overlap gate');
+
+  const straightPts = [[40, -106]];
+  lineTo(straightPts, -106, -100, 40, 120);
+  const straightOverlap = selfOverlapPct(straightPts);
+  ok(straightOverlap === 0, `synthetic straight route shows zero self-overlap: ${straightOverlap}`);
+  ok(passesOverlapGate(straightOverlap), 'the straight route passes the overlap gate');
+
+  // Threshold boundary: exactly at SELF_OVERLAP_MAX_PCT passes, a hair over fails.
+  ok(passesOverlapGate(SELF_OVERLAP_MAX_PCT) === true, `exactly ${SELF_OVERLAP_MAX_PCT}% passes the gate`);
+  ok(passesOverlapGate(SELF_OVERLAP_MAX_PCT + 0.01) === false, `${SELF_OVERLAP_MAX_PCT + 0.01}% fails the gate`);
+  ok(passesOverlapGate(0) === true, '0% overlap passes the gate');
 
   // Multi-waypoint corridor discovery (longestLegIndex/insertAnchor): the reported trip,
   // Lakewood CO -> Fernley NV -> Black Rock City NV. The long leg (Lakewood->Fernley, ~1500km)
