@@ -132,7 +132,11 @@ const OVERPASS_MAX_CENTRES = 25;
 // wall-clock isn't the sum of every chunk's latency, without firing all of them at once at a
 // free shared mirror (that would look like a burst/abuse and risks tipping a mirror from "slow"
 // into "queued/rate-limited").
-const OVERPASS_CONCURRENCY = 3;
+// ponytail: 2, not higher — Overpass's documented anonymous allowance is 2 concurrent slots per
+// IP. At 3, live testing saw the 3rd/4th request hang past the 65s client timeout with no error
+// and no abort, plus 504s at 32.6s/51.8s that only succeeded on a same-endpoint retry. Do not
+// raise this without re-verifying the per-IP slot count has changed.
+const OVERPASS_CONCURRENCY = 2;
 const DEFAULT_REFUEL_RADIUS_MI = 10; // sensible default search radius for a forced ("refuel
                                       // here") waypoint stop — wide enough to usually find
                                       // something near a small town, narrow enough to stay "near"
@@ -1850,13 +1854,19 @@ async function run() {
     if (!candidates.length) throw new Error('OSRM returned no usable route for these waypoints');
 
     const ctx = { baseMpg, rangeKm, reserve, startFuel, overLimitMph, windBasis, windDate, forcedWps, fuelType };
-    renderOptions(candidates, ctx);
-    if (candidates.length === 1) {
-      $('routeOptions').firstElementChild?.classList.add('sel');
-      await planCandidate(candidates[0], ctx);
-    } else {
-      say(`${candidates.length} route options found — pick one to plan fuel stops, or compare them first.` +
-        (candidates.length < 3 ? ' (Fewer than 3 distinct corridors survived — add a via-destination to force a different one.)' : ''));
+    // Always auto-plan the shortest corridor so one click always produces fuel stops — a
+    // multi-corridor result used to render a bare picker with nothing planned until a second
+    // click, which looked identical to a broken station lookup. planCandidate is still called
+    // exactly once here regardless of candidates.length, so this costs the same Overpass/
+    // Open-Meteo budget as the old single-corridor case; the picker lets the user replan a
+    // different corridor afterward at that corridor's own cost.
+    const bestI = pickBestCandidate(candidates);
+    renderOptions(candidates, ctx, bestI);
+    await planCandidate(candidates[bestI], ctx);
+    if (candidates.length > 1) {
+      $('compare').innerHTML = `${candidates.length} route options found — planned the shortest ` +
+        `(${candidates[bestI].label}). Pick a different one above to replan its stops.` +
+        (candidates.length < 3 ? ' (Fewer than 3 distinct corridors survived — add a via-destination to force a different one.)' : '');
       // On demand, not eager: comparing every corridor means a full terrain+wind fetch per
       // corridor (see compareCandidates) — firing that on every "Plan route" click is real
       // Open-Meteo volume (measured: a 3-corridor comparison alone was the majority of a click's
@@ -1878,14 +1888,19 @@ async function run() {
   }
 }
 
-function renderOptions(candidates, ctx) {
+// Index of the corridor to auto-plan: the shortest by distance, first wins on an exact tie.
+function pickBestCandidate(candidates) {
+  return candidates.reduce((best, c, i) => c.route.distance < candidates[best].route.distance ? i : best, 0);
+}
+
+function renderOptions(candidates, ctx, selectedIndex) {
   const shortest = candidates.reduce((a, c) => Math.min(a, c.route.distance), Infinity);
   const shortestDur = candidates.find(c => c.route.distance === shortest).route.duration;
   $('routeOptions').innerHTML = candidates.map((c, i) => {
     const pctD = (c.route.distance / shortest - 1) * 100;
     const dh = (c.route.duration - shortestDur) / 3600;
     const cmp = pctD < 0.5 ? 'shortest' : `+${pctD.toFixed(1)}%, +${dh.toFixed(1)}h`;
-    return `<div class="opt" data-i="${i}">
+    return `<div class="opt${i === selectedIndex ? ' sel' : ''}" data-i="${i}">
       <div class="name">${c.label}</div>
       <div class="meta">${mi(c.route.distance / 1000)} mi · ${(c.route.duration / 3600).toFixed(1)} h · ${cmp}</div>
     </div>`;
@@ -2522,6 +2537,42 @@ if (new URLSearchParams(location.search).get('test')) {
   const absurdRoute = { route: { distance: 500000 * ABSURD_MULT + 1, legs: [{ steps: [{ ref: 'US 6', distance: 1 }] }] }, coords: [] };
   ok(keepAndLabel([soleRoute, absurdRoute]).length === 1,
     'a route over ABSURD_MULT x the shortest survivor is dropped');
+
+  // pickBestCandidate (silent two-click gate fix): run() used to plan nothing at all until a
+  // second click when 2+ corridors came back — see run(). It must pick the shortest by distance,
+  // first wins on a tie, and a single candidate is trivially its own answer.
+  const distCandidates = [{ route: { distance: 1559100 } }, { route: { distance: 1549600 } }, { route: { distance: 1633000 } }];
+  ok(pickBestCandidate(distCandidates) === 1, `shortest of three candidates is picked, got index ${pickBestCandidate(distCandidates)}`);
+  ok(pickBestCandidate([{ route: { distance: 500000 } }]) === 0, 'a single candidate is trivially "best" at index 0');
+  const tiedCandidates = [{ route: { distance: 500000 } }, { route: { distance: 500000 } }];
+  ok(pickBestCandidate(tiedCandidates) === 0, 'an exact distance tie keeps the first candidate, not the last');
+
+  // Integration: reproduces exactly what run() now does for a multi-corridor result
+  // (pickBestCandidate -> renderOptions -> planCandidate(candidates[bestI], ctx)) and checks the
+  // corridor count planned is exactly one — not zero (the original bug) and not all of them
+  // (would multiply Overpass/Open-Meteo cost by corridor count). planCandidate is swapped for a
+  // call-counting stub; it has no internal await so the push below is synchronous, no need to
+  // await the call.
+  {
+    const origPlanCandidate = planCandidate;
+    const calls = [];
+    planCandidate = c => { calls.push(c); };
+    const fixtureCandidates = [
+      { route: { distance: 1559100, duration: 50000 }, label: 'via I-80 / I-25', coords: [] },
+      { route: { distance: 1549600, duration: 49000 }, label: 'via I-70 / US-50', coords: [] },
+      { route: { distance: 1633000, duration: 52000 }, label: 'via I-80 / US-191', coords: [] },
+    ];
+    const bestI = pickBestCandidate(fixtureCandidates);
+    renderOptions(fixtureCandidates, {}, bestI);
+    planCandidate(fixtureCandidates[bestI], {});
+    planCandidate = origPlanCandidate;
+    ok(calls.length === 1, `exactly one corridor is planned for a multi-corridor result, got ${calls.length}`);
+    ok(calls[0] === fixtureCandidates[1], 'the planned corridor is the shortest one, not an arbitrary one');
+    const selEls = [...$('routeOptions').children].filter(el => el.classList.contains('sel'));
+    ok(selEls.length === 1 && selEls[0].dataset.i === String(bestI),
+      'the picker visibly marks the auto-planned corridor as selected, unambiguously tied to the shown stops');
+    $('routeOptions').innerHTML = ''; // don't leak this fixture into real page state
+  }
 
   // keepAndLabel + anchorAt: reproduces the real bug found while wiring up the anchor probe grid
   // (real OSRM data, Lakewood CO -> Fernley NV). An anchored Price-UT candidate shares so much
