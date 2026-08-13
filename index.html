@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Gas Stop Planner</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%E2%9B%BD%3C/text%3E%3C/svg%3E">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <style>
   :root { color-scheme: light dark; --bg:#fff; --fg:#111; --mut:#666; --line:#ddd; --accent:#c2410c; }
@@ -49,6 +50,21 @@
            margin-left:5px; vertical-align:middle; }
   .badge.fuel { background:rgba(194,65,12,.15); color:var(--accent); }
   .badge.hours { background:rgba(22,163,74,.18); color:#16a34a; }
+  .badge.mismatch { background:rgba(220,38,38,.15); color:#dc2626; }
+  #lookupProgress { margin-top:8px; }
+  #lookupProgress progress { width:100%; accent-color:var(--accent); }
+  #lookupMeta { margin-top:3px; }
+  #mobileActions { display:none; }
+  @media (max-width: 800px) {
+    #panel { padding-bottom:66px; }
+    #mobileActions { display:flex; gap:8px; position:fixed; left:0; right:0; bottom:0; z-index:1000;
+                      padding:8px 10px; background:var(--bg); border-top:1px solid var(--line); }
+    #mobileActions button { margin:0; }
+    /* Same 66px the action bar reserves in #panel, applied to Leaflet's own bottom-anchored
+       control layer (zoom + attribution) instead of #map itself — #map keeps height:100% so the
+       grid row sizing is untouched, only the controls inside it shift up clear of the bar. */
+    #map .leaflet-bottom { bottom:66px; }
+  }
 </style>
 </head>
 <body>
@@ -104,6 +120,10 @@
   <button id="cmpBtn" type="button" style="display:none">Compare corridors</button>
   <div id="compare" class="meta"></div>
   <div id="status"></div>
+  <div id="lookupProgress" style="display:none">
+    <progress id="lookupBar"></progress>
+    <div id="lookupMeta" class="meta"></div>
+  </div>
   <div id="econ" class="meta"></div>
   <ol id="wpInfo"></ol>
   <ol id="stops"></ol>
@@ -114,6 +134,13 @@
   <div id="exportOut" class="meta"></div>
 </div>
 <div id="map"></div>
+<!-- Mobile-only proxy for the two step buttons — kept as its own bar, not a reposition of #go/
+     #planBtn, so the form and desktop layout stay untouched (see the JS below for how it mirrors
+     the real buttons' disabled state). -->
+<div id="mobileActions">
+  <button id="goMobile" type="button">Find routes</button>
+  <button id="planBtnMobile" type="button" disabled>Plan fuel stops</button>
+</div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
@@ -1120,18 +1147,19 @@ async function getJSONRetry(url, { attempts = 3, timeout, backoffMs = 1000 } = {
 // data, so it should fail loud and fast instead of hanging. 2 attempts, an 8s timeout, 1s flat
 // backoff -> worst case ~9s per fetch instead of the default's ~138s.
 const OPEN_METEO_RETRY = { attempts: 2, timeout: 8000, backoffMs: 1000 };
-async function postOverpass(query) {
+async function postOverpass(query, current = () => true) {
   const body = 'data=' + encodeURIComponent(query);
   let last;
-  for (const endpoint of OVERPASS_ENDPOINTS) {
+  for (let m = 0; m < OVERPASS_ENDPOINTS.length; m++) {
     for (let attempt = 0; attempt < 3; attempt++) {
+      overpassAttempt = { mirror: m + 1, attempt: attempt + 1 }; // read live by updateLookupClock
       try {
-        return await getJSON(endpoint, { method: 'POST', body, timeout: 65000, // > server's own [timeout:60]
+        return await getJSON(OVERPASS_ENDPOINTS[m], { method: 'POST', body, timeout: 65000, // > server's own [timeout:60]
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
       } catch (err) {
         last = err;
         if (!transientRetryable(err)) throw err; // a real failure, don't hammer
-        say('Overpass is busy, waiting…');
+        if (current()) say('Overpass is busy, waiting…');
         await new Promise(done => setTimeout(done, 5000 * (attempt + 1)));
       }
     }
@@ -1181,6 +1209,31 @@ function fuelTagValue(tags, fuelType) {
 function filterFuelType(stations, fuelType) {
   return stations.filter(s => fuelTagValue(s.tags, fuelType) !== 'no');
 }
+// Extends the three-way read (see fuelTagValue) with a fourth, display-only case: a station that
+// was surveyed for at least one fuel:* dimension but none of those tags says yes to the one the
+// user picked (e.g. an LPG-only pump tagged fuel:lpg=yes and nothing else, offered to a gasoline
+// vehicle — the "Wells Propane Inc" case). Distinct from "no tags at all", which stays a true
+// unknown per the app's existing policy — see fuelTagValue's own comment on why silence must not
+// read as "no". Not an exclusion: filterFuelType above is untouched, fuel:X=no on the selected
+// type remains the only thing dropped.
+// FUEL_TAG.gasoline is null (no single canonical key, see its own comment) but real US stations
+// do tag specific gasoline grades — verified against two live stops on the Lakewood CO -> Black
+// Rock City NV repro (2026-08-13): a Maverik tagged fuel:unleaded=yes/fuel:midgrade=yes/
+// fuel:premium=yes and fuel:diesel=yes, no fuel:gasoline key at all — exactly FUEL_TAG's
+// documented case, but this badge would have wrongly flagged it "may not sell gasoline" without
+// recognizing these. octane_9x kept too (a less common but real alternative for the same grades).
+const GASOLINE_YES_KEYS = ['fuel:unleaded', 'fuel:midgrade', 'fuel:premium',
+  'fuel:octane_91', 'fuel:octane_95', 'fuel:octane_98', 'fuel:octane_100'];
+function fuelMismatch(tags, fuelType) {
+  if (fuelTagValue(tags, fuelType) !== null) return false; // 'yes' matches, 'no' is filterFuelType's job
+  const t = tags || {};
+  if (fuelType === 'gasoline' && GASOLINE_YES_KEYS.some(k => t[k] === 'yes')) return false;
+  // "Explicit" means a real yes/no value. Also verified on that same repro: a Chevron tagged
+  // fuel:octane_91..93 (and fuel:diesel) all ="unknown" — OSM's own convention for "not yet
+  // surveyed", not a real answer — so those don't count as "at least one explicit fuel:* tag"
+  // either; collapsing them in would wrongly flag a station nobody has actually surveyed.
+  return Object.keys(t).some(k => k.startsWith('fuel:') && (t[k] === 'yes' || t[k] === 'no'));
+}
 // ponytail: opening_hours is OSM's full mini-language (weekday ranges, holidays, seasons, date
 // exceptions) — a real parser is a library-sized dependency (see opening_hours.js on npm). We only
 // ever show the raw string as-is and special-case the one literal token that actually matters for
@@ -1198,14 +1251,18 @@ function is247(openStr) { return !!openStr && openStr.trim() === '24/7'; }
 // dense area. Kept at the same SEARCH_RADIUS_M as overpassFuel (verified: 3km near downtown
 // Denver returns 17, well under the cap) so it's a safe like-for-like substitute, not a
 // wholesale redesign of the search geometry.
+// name -> brand -> operator -> generic label, shared by every station source (Overpass tags,
+// Photon properties) so a station only shows as "Unnamed" when none of the three is present —
+// OSM frequently carries brand or operator on a node whose own name tag was never filled in.
+function stationName(props) { return props.name || props.brand || props.operator || 'Unnamed fuel station'; }
 async function photonFuelOne(centre, radiusM) {
   const j = await getJSONRetry(`https://photon.komoot.io/reverse?lat=${centre[0].toFixed(5)}&lon=${centre[1].toFixed(5)}` +
     `&osm_tag=amenity:fuel&radius=${(radiusM / 1000).toFixed(2)}&limit=50`);
   return j.features.map(f => ({ lat: f.geometry.coordinates[1], lon: f.geometry.coordinates[0],
-    name: f.properties.name || 'Unnamed fuel station', brand: '', open: '', tags: {} })); // Photon
-    // doesn't expose brand/opening_hours/fuel:* tags — left honestly blank/empty rather than
-    // guessed. tags:{} (not omitted) so fuelTagValue sees "no tag" uniformly and every badge
-    // silently doesn't render, same as an Overpass station with no fuel:* tags at all.
+    name: stationName(f.properties), brand: f.properties.brand || '', open: '', tags: {} })); // Photon
+    // doesn't expose opening_hours/fuel:* tags — left honestly blank/empty rather than guessed.
+    // tags:{} (not omitted) so fuelTagValue sees "no tag" uniformly and every badge silently
+    // doesn't render, same as an Overpass station with no fuel:* tags at all.
 }
 // centres.length > 1 only happens on the Overpass-exhausted fallback path (a whole chunk's worth
 // of centres) — run with the same concurrency cap as the main sweep since Photon still only
@@ -1226,28 +1283,30 @@ async function photonFuel(centres, radiusM) {
 // inventing a second precision) survives that jitter the same way.
 function stationCacheKey(centres, radiusM) { return `${radiusM}|${centres.map(coordKey).join(';')}`; }
 const stationCache = new Map();
-async function overpassFuel(centres, radiusM = SEARCH_RADIUS_M) {
+async function overpassFuel(centres, radiusM = SEARCH_RADIUS_M, current = () => true) {
   const around = centres.map(p => `${p[0].toFixed(5)},${p[1].toFixed(5)}`).join(',');
   const cacheKey = stationCacheKey(centres, radiusM);
   if (stationCache.has(cacheKey)) return stationCache.get(cacheKey);
   let stations;
+  lookupClockStart(current); // cache miss only — a cache hit above returns before this, instant, no clock
   try {
     // "out center 300;" already returns full tags at Overpass's default "body" verbosity — no
     // verbosity keyword needed to get fuel:*/opening_hours, and no extra centre/query cost either
     // (verified: same query, payload just carries more fields per element already coming back).
     const j = await postOverpass(
-      `[out:json][timeout:60];nwr(around:${radiusM},${around})[amenity=fuel];out center 300;`);
+      `[out:json][timeout:60];nwr(around:${radiusM},${around})[amenity=fuel];out center 300;`, current);
     stations = j.elements.map(el => {
       const lat = el.lat ?? el.center?.lat, lon = el.lon ?? el.center?.lon;
       if (lat == null) return null;
       const t = el.tags || {};
-      return { lat, lon, name: t.name || t.brand || t.operator || 'Unnamed fuel station',
-               brand: t.brand || '', open: t['opening_hours'] || '', tags: t };
+      return { lat, lon, name: stationName(t), brand: t.brand || '', open: t['opening_hours'] || '', tags: t };
     }).filter(Boolean);
   } catch (err) {
     if (!err.exhausted) throw err; // a real failure (e.g. malformed query) — don't paper over it
-    say('Overpass could not be reached — falling back to Photon…');
+    if (current()) say('Overpass could not be reached — falling back to Photon…');
     stations = await photonFuel(centres, radiusM);
+  } finally {
+    lookupClockStop(current);
   }
   stationCache.set(cacheKey, stations);
   return stations;
@@ -1260,9 +1319,9 @@ async function overpassFuel(centres, radiusM = SEARCH_RADIUS_M) {
 // there's no "further along route is better" concept for a single anchor point, and nearest
 // minimises the detour from the actual place the user named. No candidates within radius ->
 // null, which the caller turns into a visible warning rather than a silent fallback.
-async function findForcedStation(wp, fuelType) {
+async function findForcedStation(wp, fuelType, current = () => true) {
   const centre = [wp.lat, wp.lon];
-  const found = filterFuelType(await overpassFuel([centre], wp.radiusMi * KM_PER_MI * 1000), fuelType);
+  const found = filterFuelType(await overpassFuel([centre], wp.radiusMi * KM_PER_MI * 1000, current), fuelType);
   if (!found.length) return null;
   return found.reduce((a, b) => haversine(centre, [b.lat, b.lon]) < haversine(centre, [a.lat, a.lon]) ? b : a);
 }
@@ -1285,12 +1344,22 @@ function chunkCentres(centres, size) {
 // keeps each query small (cheap, per the superlinear cost curve); running chunks concurrently
 // instead of sequentially means the total wait is closer to the slowest chunk than the sum of
 // all of them.
-async function fetchStations(pts, cum, windows) {
+async function fetchStations(pts, cum, windows, current = () => true) {
   const chunks = windows.flatMap(w => chunkCentres(searchCentres(pts, cum, w), OVERPASS_MAX_CENTRES));
   let done = 0;
+  // Reuse the existing "N of M search areas" count as the progress-bar signal (not a second
+  // counter) — see Finding 1's own note. A cache-hit chunk resolves instantly and still ticks the
+  // bar forward; only a genuine network wait keeps lookupClockStart's timer running meanwhile.
+  // `current` (planCandidate's own staleness check, threaded through) gates every write below so a
+  // superseded run's chunks — still resolving after a re-plan started — touch nothing on screen.
+  if (current()) { $('lookupBar').max = chunks.length; $('lookupBar').value = 0; }
   const results = await mapConcurrent(chunks, OVERPASS_CONCURRENCY, async centres => {
-    const stations = await overpassFuel(centres);
-    say(`Looking for gas stations… ${++done} of ${chunks.length} search areas`);
+    const stations = await overpassFuel(centres, undefined, current);
+    done++;
+    if (current()) {
+      $('lookupBar').value = done;
+      say(`Looking for gas stations… ${done} of ${chunks.length} search areas`);
+    }
     return stations;
   });
   return [...new Map(results.flat().map(s => [`${s.lat},${s.lon}`, s])).values()]; // windows/chunks can overlap
@@ -1510,6 +1579,44 @@ let routeLineLayer = null; // the plain polyline drawn before economy is known; 
                             // per-segment colour once planEconomy resolves — see drawEconLine.
 
 function say(msg, isError) { $('status').textContent = msg; $('status').className = isError ? 'err' : ''; }
+
+// Live "still working" readout for a station lookup, independent of say()'s text. postOverpass's
+// own retry loop only calls say() when it CATCHES a timeout/504 — while a request is genuinely in
+// flight (up to 65s per attempt, x3 attempts x2 mirrors, see postOverpass) say() has nothing new
+// to report and the status text just sits still. That reads as "gone blank" to a user with no
+// other feedback, even though #status itself is never actually cleared (say() is its only writer
+// and every call site passes non-empty text — verified by inspection). Refcounted so the up-to-
+// OVERPASS_CONCURRENCY overlapping overpassFuel calls fetchStations fires share one ticking clock
+// instead of each fighting over show/hide.
+// lookupCurrents: one current() checker per in-flight lookup (refcount-parallel, not a second
+// counter — same routesGeneration/candidate check planCandidate already builds, just handed down).
+// Start/stop themselves stay generation-blind (a stale run must still release its slot so the
+// clock doesn't wedge on for a live one, and must still stop it once every lookup — stale or live
+// — has finished); only updateLookupClock's *write* is gated, on whether any survivor is live.
+let lookupActive = 0, lookupStart = 0, lookupTimer = null, overpassAttempt = null;
+const lookupCurrents = new Set();
+function lookupClockStart(current = () => true) {
+  lookupCurrents.add(current);
+  if (lookupActive++ > 0) return;
+  lookupStart = Date.now();
+  $('lookupProgress').style.display = '';
+  updateLookupClock();
+  lookupTimer = setInterval(updateLookupClock, 1000);
+}
+function lookupClockStop(current = () => true) {
+  lookupCurrents.delete(current);
+  if (--lookupActive > 0) return;
+  clearInterval(lookupTimer);
+  lookupTimer = null;
+  $('lookupProgress').style.display = 'none';
+}
+function updateLookupClock() {
+  if (![...lookupCurrents].some(fn => fn())) return; // every in-flight lookup is stale — write nothing
+  const elapsed = Math.round((Date.now() - lookupStart) / 1000);
+  const mirror = overpassAttempt
+    ? `mirror ${overpassAttempt.mirror} of ${OVERPASS_ENDPOINTS.length}, attempt ${overpassAttempt.attempt} of 3 — ` : '';
+  $('lookupMeta').textContent = `${mirror}${elapsed}s elapsed`;
+}
 
 // --- share trip by URL (decode half) ----------------------------------------
 // JSON + encodeURIComponent, not base64: stays plain-text-debuggable in the URL bar and sidesteps
@@ -1973,6 +2080,7 @@ async function planCandidate(candidate, { baseMpg, rangeKm, reserve, startFuel, 
   $('econ').innerHTML = '';
   $('wpInfo').innerHTML = '';
   $('exportOut').innerHTML = '';
+  $('lookupBar').removeAttribute('value'); // indeterminate until fetchStations knows a real total
   clearPanelWarnings();
   drawn.clearLayers();
   try {
@@ -2026,7 +2134,7 @@ async function planCandidate(candidate, { baseMpg, rangeKm, reserve, startFuel, 
     let forcedStops = [];
     for (const fw of forcedWps) {
       say(`Looking for a fuel station near ${fw.label.split(',')[0]}…`);
-      const station = await findForcedStation(fw, fuelType);
+      const station = await findForcedStation(fw, fuelType, current);
       if (!current()) return;
       if (!station) {
         $('panel').insertAdjacentHTML('beforeend', `<div class="warn">No mapped fuel station within ` +
@@ -2058,7 +2166,7 @@ async function planCandidate(candidate, { baseMpg, rangeKm, reserve, startFuel, 
       for (let d = firstLegKm; d < adjTotalKm; d += legKm)
         windows.push([Math.round(toReal(d - legKm * 0.5)), Math.round(toReal(d) + 5)]);
 
-      const raw = await fetchStations(pts, cum, windows);
+      const raw = await fetchStations(pts, cum, windows, current);
       if (!current()) return;
       if (!raw.length && !forcedStops.length) throw new Error('No gas stations found near this route in OpenStreetMap');
 
@@ -2231,6 +2339,11 @@ function fuelBadgeHtml(station, fuelType) {
     ? `<span class="badge fuel">${fuelType} ✓</span>` : '';
 }
 function hoursBadgeHtml(openStr) { return is247(openStr) ? '<span class="badge hours">24/7</span>' : ''; }
+// See fuelMismatch — a visible warning, not an exclusion.
+function fuelMismatchBadgeHtml(station, fuelType) {
+  return fuelMismatch(station.tags, fuelType)
+    ? `<span class="badge mismatch">may not sell ${fuelType}</span>` : '';
+}
 
 function render(stops, totalKm, route, finalLegDurationS, stopFuel, reserve, fuelType) {
   say(`${mi(totalKm)} mi, ~${(route.duration / 3600).toFixed(1)} h driving — ${stops.length} fuel stop${stops.length === 1 ? '' : 's'}.`);
@@ -2240,7 +2353,7 @@ function render(stops, totalKm, route, finalLegDurationS, stopFuel, reserve, fue
     const f = stopFuel[i];
     const low = f.pct <= reserve * 100;
     $('stops').insertAdjacentHTML('beforeend', `<li>
-      <div class="name"><span class="n">${i + 1}</span>${s.name}${s.forced ? ' <span class="meta">(your required stop)</span>' : ''}${fuelBadgeHtml(s, fuelType)}${hoursBadgeHtml(s.open)}</div>
+      <div class="name"><span class="n">${i + 1}</span>${s.name}${s.forced ? ' <span class="meta">(your required stop)</span>' : ''}${fuelBadgeHtml(s, fuelType)}${fuelMismatchBadgeHtml(s, fuelType)}${hoursBadgeHtml(s.open)}</div>
       <div class="meta">mile ${mi(s.realKm)} · ${mi(s.realLeg)} mi / ${fmtDuration(s.legDurationS)} since last fill · ${(s.detour * 1000 / KM_PER_MI / 1000).toFixed(1)} mi off route
         · arrive with ≈ ${f.gal.toFixed(1)} gal (${f.pct.toFixed(0)}%)
         ${s.open ? '· ' + s.open : ''}
@@ -2256,11 +2369,16 @@ function render(stops, totalKm, route, finalLegDurationS, stopFuel, reserve, fue
 // totalKm/effMpg, see the self-checks), so it can't silently disagree with the number already
 // shown above it. $/gal has no keyless, no-network source, so it's a plain user-editable input
 // (#price), not fetched or hardcoded data.
+// Keyed by id (not appended fresh each time) so a live price edit can call this again to update
+// the same line in place instead of stacking a duplicate — see the #price input listener below.
 function renderTripFuel(totalGal, fillUps) {
   const price = +$('price').value || 0;
   const cost = price > 0 ? ` · ≈ $${(totalGal * price).toFixed(2)} at $${price.toFixed(2)}/gal` : '';
-  $('econ').insertAdjacentHTML('beforeend',
-    `<div class="meta">Trip total ≈ ${totalGal.toFixed(1)} gal · ${fillUps} fill-up${fillUps === 1 ? '' : 's'}${cost}</div>`);
+  const text = `Trip total ≈ ${totalGal.toFixed(1)} gal · ${fillUps} fill-up${fillUps === 1 ? '' : 's'}${cost}`;
+  const el = document.getElementById('tripTotal');
+  if (el) el.textContent = text;
+  else $('econ').insertAdjacentHTML('beforeend', `<div id="tripTotal" class="meta">${text}</div>`);
+  if (currentTrip) { currentTrip.totalGal = totalGal; currentTrip.fillUps = fillUps; }
 }
 
 function tripName(trip) {
@@ -2303,9 +2421,27 @@ $('windBasis').addEventListener('change', invalidateRoutes);
 // planning — so it's deliberately left out here.
 ['reserve', 'fuel', 'over', 'windDate'].forEach(id => $(id).addEventListener('input', invalidateRoutes));
 
+// Re-render only — no replan, no network request. A typed price should show up immediately
+// (Finding 2) rather than waiting for the next "Plan fuel stops" click, but per the comment above
+// it must never invalidate the plan.
+$('price').addEventListener('input', () => {
+  if (currentTrip && currentTrip.totalGal != null) renderTripFuel(currentTrip.totalGal, currentTrip.fillUps);
+});
+
 $('go').addEventListener('click', findRoutes);
 $('planBtn').addEventListener('click', planSelected);
 $('panel').addEventListener('keydown', e => { if (e.key === 'Enter') findRoutes(); });
+
+// Mobile sticky action bar (Finding 6): #goMobile/#planBtnMobile just proxy a click onto the real
+// buttons rather than duplicating findRoutes/planSelected's wiring, and a MutationObserver mirrors
+// each real button's disabled state so this bar can't drift out of sync with the one source of
+// truth. Hidden entirely on desktop (see the #mobileActions CSS) — the form itself is untouched.
+$('goMobile').addEventListener('click', () => $('go').click());
+$('planBtnMobile').addEventListener('click', () => $('planBtn').click());
+new MutationObserver(() => { $('goMobile').disabled = $('go').disabled; })
+  .observe($('go'), { attributes: true, attributeFilter: ['disabled'] });
+new MutationObserver(() => { $('planBtnMobile').disabled = $('planBtn').disabled; })
+  .observe($('planBtn'), { attributes: true, attributeFilter: ['disabled'] });
 
 // --- self check: ?test=1 ---------------------------------------------------
 
@@ -2758,6 +2894,66 @@ if (new URLSearchParams(location.search).get('test')) {
       waypoints = savedWaypoints;
       savedFields.forEach(([id, v]) => { $(id).value = v; });
     }
+  })();
+
+  // Defect 1 (progress bar / meta / status not generation-gated): fetchStations/overpassFuel/
+  // lookupClockStart now take the same `current` checker planCandidate builds and thread it all the
+  // way down, same reuse-not-reinvent shape as staleRunChecks above. postOverpass is swapped for a
+  // controllable-resolve stub (the actual network boundary — see postOverpass's own fetch call) so
+  // the test decides exactly when a "response" lands relative to a simulated invalidation, not
+  // timing luck. Windows pick single, geographically distinct centres so each run is a real
+  // (stubbed) request, never an instant cache hit that would skip lookupClockStart/postOverpass
+  // entirely.
+  const lookupGatingChecks = (async () => {
+    const origPostOverpass = postOverpass;
+    const savedStatus = $('status').textContent;
+    stationCache.clear();
+    let aLive = true;
+    const currentA = () => aLive, currentB = () => true; // B is never superseded in this scenario
+    const resolvers = [];
+    postOverpass = () => new Promise(res => resolvers.push(res));
+
+    // Run A starts (still current) — its own bar/meta writes land normally.
+    const pA = fetchStations(pts, cum, [[0, 0]], currentA);
+    await new Promise(r => setTimeout(r, 0)); // let A reach its postOverpass await
+    ok(+$('lookupBar').max === 1 && $('lookupProgress').style.display !== 'none',
+      'a live run sets a real bar max and shows the progress bar');
+    ok(/elapsed/.test($('lookupMeta').textContent), 'a live run writes the elapsed-time meta on start');
+
+    // Simulated invalidation + replan: A is superseded, B is the new live run.
+    aLive = false;
+    $('lookupMeta').textContent = 'SENTINEL'; // updateLookupClock's own gate, checked directly below
+                                               // — the real interval is 1s, too slow for a fast test
+    updateLookupClock();
+    ok($('lookupMeta').textContent === 'SENTINEL', 'updateLookupClock writes nothing while every in-flight lookup is stale');
+    const pB = fetchStations(pts, cum, [[500, 500]], currentB);
+    await new Promise(r => setTimeout(r, 0)); // let B reach its postOverpass await
+    updateLookupClock();
+    ok($('lookupMeta').textContent !== 'SENTINEL', 'updateLookupClock writes again once a live lookup (B) is in flight');
+
+    // Release A (the superseded run) first — its chunk resolving must not touch anything B owns.
+    const barBeforeA = { max: $('lookupBar').max, value: $('lookupBar').value };
+    const statusBeforeA = $('status').textContent;
+    resolvers[0]({ elements: [] });
+    await pA;
+    ok($('status').textContent === statusBeforeA, 'a superseded run resolving writes nothing to #status');
+    ok($('lookupBar').max === barBeforeA.max && $('lookupBar').value === barBeforeA.value,
+      'a superseded run resolving writes nothing to #lookupBar');
+    ok(lookupActive === 1, 'A releases its refcount slot but the still-live B keeps the shared clock running');
+    ok($('lookupProgress').style.display !== 'none', 'progress UI stays visible — B is still working');
+
+    // Release B — the sole remaining (live) run: its own progress lands, and the clock/progress UI
+    // fully stop once nothing is left in flight (not stuck visible, not left ticking).
+    resolvers[1]({ elements: [] });
+    await pB;
+    ok(+$('lookupBar').value === 1, `a live run's own completion updates the bar it owns, got ${$('lookupBar').value}`);
+    ok($('status').textContent.includes('1 of 1 search areas'), 'a live run\'s own completion updates #status');
+    ok(lookupActive === 0, 'refcount returns to zero once every lookup — stale or live — has finished');
+    ok($('lookupProgress').style.display === 'none', 'progress UI hides once nothing is in flight — not stuck visible');
+    ok(lookupTimer === null, 'the interval timer is cleared, not left ticking after everything settles');
+
+    postOverpass = origPostOverpass;
+    $('status').textContent = savedStatus;
   })();
 
   // keepAndLabel + anchorAt: reproduces the real bug found while wiring up the anchor probe grid
@@ -3254,6 +3450,50 @@ if (new URLSearchParams(location.search).get('test')) {
   ok(filterFuelType([untagged, dieselNo, dieselYes], 'gasoline').length === 3,
     'gasoline (no tag key) excludes nothing at all');
 
+  // fuelMismatch: the fourth, display-only case (Finding 3) — match / explicit mismatch / no tags
+  // at all. "Wells Propane Inc" shape: an LPG-only pump tagged for one fuel dimension that isn't
+  // gasoline, offered to a gasoline vehicle — flagged, but never excluded (filterFuelType keeps it).
+  const propaneOnly = { name: 'Wells Propane Inc', tags: { 'fuel:lpg': 'yes' } };
+  ok(fuelMismatch(propaneOnly.tags, 'gasoline'), 'a station tagged only fuel:lpg=yes is a known mismatch for gasoline');
+  ok(filterFuelType([propaneOnly], 'gasoline').length === 1, 'a known mismatch is flagged, not excluded — fuel:lpg=yes says nothing about fuel:gasoline');
+  ok(!fuelMismatch(girtonTags, 'e85'), 'an explicit match (fuel:e85=yes) is not a mismatch');
+  ok(!fuelMismatch(untagged.tags, 'gasoline'), 'a station with no fuel:* tags at all is unknown, not a mismatch');
+  ok(!fuelMismatch(dieselNo.tags, 'diesel'), 'an explicit "no" is filterFuelType\'s exclusion, not this badge\'s concern');
+  // Real tag shapes pulled live off the Lakewood CO -> Black Rock City NV repro (2026-08-13) — a
+  // naive "any fuel:* key present" reading flagged both of these as gasoline mismatches; fixed by
+  // recognizing GASOLINE_YES_KEYS and requiring an actual yes/no value, not "unknown".
+  const realMaverik = { 'fuel:diesel': 'yes', 'fuel:ethanol-free': 'yes', 'fuel:midgrade': 'yes', 'fuel:premium': 'yes', 'fuel:unleaded': 'yes' };
+  const realChevron = { 'fuel:diesel': 'unknown', 'fuel:octane_91': 'unknown', 'fuel:octane_92': 'unknown', 'fuel:octane_93': 'unknown' };
+  ok(!fuelMismatch(realMaverik, 'gasoline'), 'a real station tagging fuel:unleaded/midgrade/premium=yes is a gasoline match, not a mismatch');
+  ok(!fuelMismatch(realChevron, 'gasoline'), 'fuel:*=unknown (OSM\'s "not surveyed" convention) does not count as an explicit tag');
+
+  // name/brand/operator fallback chain (Finding 4) — OSM frequently carries brand or operator on a
+  // node whose own name tag was never filled in; only fall all the way back to the generic label
+  // when none of the three is present.
+  ok(stationName({ name: 'Sinclair', brand: 'Shell' }) === 'Sinclair', 'name wins over brand when both are present');
+  ok(stationName({ brand: 'Shell' }) === 'Shell', 'falls back to brand when name is missing');
+  ok(stationName({ operator: 'Kum & Go LLC' }) === 'Kum & Go LLC', 'falls back to operator when name and brand are both missing');
+  ok(stationName({}) === 'Unnamed fuel station', 'generic label only when name, brand, and operator are all missing');
+
+  // price re-render (Finding 2): renderTripFuel updates the same node in place — a live price edit
+  // must never stack a second "Trip total" line, and must recompute without touching currentTrip's
+  // route/stop data (no replan, no network request; wired via the #price input listener).
+  {
+    const savedTrip = currentTrip, savedEcon = $('econ').innerHTML, savedPrice = $('price').value;
+    currentTrip = { totalGal: 10 };
+    $('price').value = '4.00';
+    renderTripFuel(10, 1);
+    const el1 = document.getElementById('tripTotal');
+    ok(el1 && el1.textContent.includes('$40.00 at $4.00/gal'), `first render reflects $4.00/gal, got "${el1 && el1.textContent}"`);
+    $('price').value = '9.99';
+    $('price').dispatchEvent(new Event('input'));
+    const el2 = document.getElementById('tripTotal');
+    ok(el2 === el1, 'price re-render reuses the same node instead of appending a duplicate');
+    ok(el2.textContent.includes('$99.90 at $9.99/gal'), `price edit updated the displayed cost live, got "${el2.textContent}"`);
+    ok(currentTrip.totalGal === 10, 'price re-render did not touch the planned totalGal — no replan');
+    currentTrip = savedTrip; $('econ').innerHTML = savedEcon; $('price').value = savedPrice;
+  }
+
   // 24/7 detection: exact literal token only — this is a raw-string display, not a parser (see
   // is247's own ponytail comment), so anything else just shows as text with no badge.
   ok(is247('24/7'), 'literal "24/7" is detected');
@@ -3269,7 +3509,7 @@ if (new URLSearchParams(location.search).get('test')) {
   ok(hoursBadgeHtml(photonStation.open) === '', 'a Photon-sourced station renders no 24/7 badge (open is always "")');
   ok(filterFuelType([photonStation], 'diesel').length === 1, 'a Photon-sourced station is never excluded by fuel type — unknown, not "no"');
 
-  Promise.all([mapConcurrentCheck, staleRunChecks]).then(() => {
+  Promise.all([mapConcurrentCheck, staleRunChecks, lookupGatingChecks]).then(() => {
     console.log('%call self checks passed', 'color:green;font-weight:bold');
     say('Self checks passed — see console.');
   }).catch(err => {
