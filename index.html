@@ -1593,10 +1593,18 @@ function say(msg, isError) { $('status').textContent = msg; $('status').classNam
 // Start/stop themselves stay generation-blind (a stale run must still release its slot so the
 // clock doesn't wedge on for a live one, and must still stop it once every lookup — stale or live
 // — has finished); only updateLookupClock's *write* is gated, on whether any survivor is live.
+// Array, not a Set: fetchStations hands the SAME `current` closure to every concurrent chunk of
+// one run (OVERPASS_CONCURRENCY overlapping calls), so a Set would dedupe them to one entry and
+// the first chunk to finish would delete-by-identity out from under a sibling chunk still
+// genuinely in flight — the meta text then reads live() as false and stops writing, a frozen
+// clock next to real ongoing work. Confirmed live: 2026-08-13, the reported "78s elapsed" freeze
+// reproduces by starting the same closure twice and stopping it once (see repro_freeze.mjs).
+// Push/splice-one instead keeps a true per-call count, same as lookupActive already does for the
+// bar/timer.
 let lookupActive = 0, lookupStart = 0, lookupTimer = null, overpassAttempt = null;
-const lookupCurrents = new Set();
+const lookupCurrents = [];
 function lookupClockStart(current = () => true) {
-  lookupCurrents.add(current);
+  lookupCurrents.push(current);
   if (lookupActive++ > 0) return;
   lookupStart = Date.now();
   $('lookupProgress').style.display = '';
@@ -1604,14 +1612,16 @@ function lookupClockStart(current = () => true) {
   lookupTimer = setInterval(updateLookupClock, 1000);
 }
 function lookupClockStop(current = () => true) {
-  lookupCurrents.delete(current);
+  const i = lookupCurrents.indexOf(current);
+  if (i !== -1) lookupCurrents.splice(i, 1); // remove ONE instance — a sibling call sharing the
+                                              // same closure must stay registered
   if (--lookupActive > 0) return;
   clearInterval(lookupTimer);
   lookupTimer = null;
   $('lookupProgress').style.display = 'none';
 }
 function updateLookupClock() {
-  if (![...lookupCurrents].some(fn => fn())) return; // every in-flight lookup is stale — write nothing
+  if (!lookupCurrents.some(fn => fn())) return; // every in-flight lookup is stale — write nothing
   const elapsed = Math.round((Date.now() - lookupStart) / 1000);
   const mirror = overpassAttempt
     ? `mirror ${overpassAttempt.mirror} of ${OVERPASS_ENDPOINTS.length}, attempt ${overpassAttempt.attempt} of 3 — ` : '';
@@ -2956,7 +2966,61 @@ if (new URLSearchParams(location.search).get('test')) {
     $('status').textContent = savedStatus;
   })();
 
+  // Regression check for the live-site freeze (2026-08-13): fetchStations hands the SAME `current`
+  // closure to every concurrent chunk of one run (mapConcurrent + OVERPASS_CONCURRENCY), unlike
+  // lookupGatingChecks above where run A and run B are deliberately different closures. A Set-based
+  // lookupCurrents dedupes same-closure registrations to one entry, so the first of two concurrent
+  // chunks to finish deletes it out from under a sibling chunk that's still genuinely in flight —
+  // updateLookupClock then sees no live checker and stops writing, freezing the meta text next to a
+  // still-ticking bar/timer. lookupCurrents is an array (push/splice-one) specifically so this
+  // doesn't happen; this check pins that.
+  const lookupSharedClosureChecks = (async () => {
+    await lookupGatingChecks; // wait for clean global state (lookupActive back to 0) — this and
+                               // lookupGatingChecks both drive the same top-level lookupActive/
+                               // lookupCurrents/lookupTimer, and lookupGatingChecks' own awaits
+                               // (setTimeout(0)) would otherwise interleave with this block's
+                               // synchronous writes.
+    const savedMeta = $('lookupMeta').textContent;
+    const current = () => true;
+    lookupClockStart(current); // chunk A
+    lookupClockStart(current); // chunk B — identical closure, genuinely concurrent
+    lookupClockStop(current); // A finishes first; B is still in flight
+    $('lookupMeta').textContent = 'SENTINEL3';
+    updateLookupClock();
+    ok($('lookupMeta').textContent !== 'SENTINEL3',
+      'a still-live sibling sharing the same current() closure keeps the clock writing after the other stops');
+
+    // Elapsed advances across simulated time while genuinely live — paint-time read of lookupStart,
+    // not an accumulated counter, so a delayed paint still shows the correct wall-clock value.
+    lookupStart = Date.now() - 5000;
+    updateLookupClock();
+    const meta5 = $('lookupMeta').textContent;
+    lookupStart = Date.now() - 9000;
+    updateLookupClock();
+    const meta9 = $('lookupMeta').textContent;
+    ok(meta5.includes('5s elapsed') && meta9.includes('9s elapsed'),
+      'elapsed value advances across simulated time while a lookup is live');
+
+    lookupClockStop(current); // B finishes — fully drained
+    ok(lookupActive === 0 && lookupCurrents.length === 0, 'both instances of the shared closure are gone once both stop');
+    ok(lookupTimer === null && $('lookupProgress').style.display === 'none', 'progress UI fully stops once drained');
+
+    // A superseded lookup (its current() now false) still writes nothing, even sharing a closure
+    // slot with a live sibling — generation gating is per-call-site, not weakened by the fix above.
+    let live = true;
+    const staleCurrent = () => live;
+    lookupClockStart(staleCurrent);
+    live = false; // superseded
+    $('lookupMeta').textContent = 'SENTINEL4';
+    updateLookupClock();
+    ok($('lookupMeta').textContent === 'SENTINEL4', 'a superseded lookup still writes nothing to #lookupMeta');
+    lookupClockStop(staleCurrent);
+
+    $('lookupMeta').textContent = savedMeta;
+  })();
+
   // keepAndLabel + anchorAt: reproduces the real bug found while wiring up the anchor probe grid
+
   // (real OSRM data, Lakewood CO -> Fernley NV). An anchored Price-UT candidate shares so much
   // mileage with the base I-80/I-25 route that both routes' 50%-by-distance node is identical
   // (40.756337,-111.912037) — without the anchorAt hint they wrongly dedupe to one corridor;
@@ -3509,7 +3573,7 @@ if (new URLSearchParams(location.search).get('test')) {
   ok(hoursBadgeHtml(photonStation.open) === '', 'a Photon-sourced station renders no 24/7 badge (open is always "")');
   ok(filterFuelType([photonStation], 'diesel').length === 1, 'a Photon-sourced station is never excluded by fuel type — unknown, not "no"');
 
-  Promise.all([mapConcurrentCheck, staleRunChecks, lookupGatingChecks]).then(() => {
+  Promise.all([mapConcurrentCheck, staleRunChecks, lookupGatingChecks, lookupSharedClosureChecks]).then(() => {
     console.log('%call self checks passed', 'color:green;font-weight:bold');
     say('Self checks passed — see console.');
   }).catch(err => {
