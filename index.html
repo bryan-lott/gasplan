@@ -98,8 +98,9 @@
     <input id="windDate" type="date" style="display:none">
   </div>
   <div id="windNote" class="meta"></div>
-  <button id="go">Plan route</button>
+  <button id="go">Find routes</button>
   <div id="routeOptions"></div>
+  <button id="planBtn" type="button" disabled>Plan fuel stops</button>
   <button id="cmpBtn" type="button" style="display:none">Compare corridors</button>
   <div id="compare" class="meta"></div>
   <div id="status"></div>
@@ -1609,6 +1610,7 @@ $('waypoints').addEventListener('input', e => {
   else if (e.target.classList.contains('wp-radius')) waypoints[i].radiusMi = clampRadius(e.target.value);
   else return;
   saveWaypoints();
+  invalidateRoutes(); // waypoint text/radius no longer matches whatever step 1 last found
 });
 $('waypoints').addEventListener('change', e => {
   if (!e.target.classList.contains('wp-refuel')) return;
@@ -1616,22 +1618,23 @@ $('waypoints').addEventListener('change', e => {
   waypoints[i].refuel = e.target.checked;
   e.target.closest('.wp-block').querySelector('.wp-radius').style.display = waypoints[i].refuel ? '' : 'none';
   saveWaypoints();
+  invalidateRoutes();
 });
 
 $('waypoints').addEventListener('click', e => {
   const i = +e.target.dataset.i;
   if (e.target.classList.contains('up') && i > 0) {
     waypoints = moveWaypoint(waypoints, i, i - 1);
-    renderWaypoints(); saveWaypoints(); clearPlanResults();
+    renderWaypoints(); saveWaypoints(); invalidateRoutes();
   } else if (e.target.classList.contains('dn') && i < waypoints.length - 1) {
     waypoints = moveWaypoint(waypoints, i, i + 1);
-    renderWaypoints(); saveWaypoints(); clearPlanResults();
+    renderWaypoints(); saveWaypoints(); invalidateRoutes();
   } else if (e.target.classList.contains('ins')) {
     waypoints = insertWaypoint(waypoints, i + 1, mkWaypoint(''));
-    renderWaypoints(); saveWaypoints(); clearPlanResults();
+    renderWaypoints(); saveWaypoints(); invalidateRoutes();
   } else if (e.target.classList.contains('rm') && waypoints.length > 2) {
     waypoints.splice(i, 1);
-    renderWaypoints(); saveWaypoints(); clearPlanResults();
+    renderWaypoints(); saveWaypoints(); invalidateRoutes();
   }
 });
 
@@ -1640,7 +1643,7 @@ $('addWp').addEventListener('click', () => { waypoints.push(mkWaypoint('')); ren
 $('reverseWp').addEventListener('click', () => {
   waypoints = reverseTrip(waypoints);
   renderWaypoints(); saveWaypoints();
-  run(); // reuse the normal replan path — no separate reverse-and-plan logic
+  findRoutes(); // reuse the normal step-1 path — no separate reverse-and-plan logic
 });
 
 // fromArray (a share-hash's wp[]) wins when present; either way every entry is routed through
@@ -1696,6 +1699,7 @@ function vehicleState() {
 }
 function saveVehicle() { localStorage.setItem(VKEY, JSON.stringify(vehicleState())); }
 $('fuelType').addEventListener('change', saveVehicle);
+$('fuelType').addEventListener('change', invalidateRoutes); // filters the fuel-stop search — plan is stale
 
 $('vy').addEventListener('change', async () => {
   resetSelect($('vmk'), 'Make…'); resetSelect($('vmd'), 'Model…'); resetSelect($('vtr'), 'Trim…');
@@ -1730,13 +1734,13 @@ $('vtr').addEventListener('change', async () => {
       $('tankNote').textContent = `Est. from vehicle class (${d.VClass}), not from any API ` +
         `(EPA has no tank field). Verify against your manual or fuel door.`;
     }
-    updateRange(); saveVehicle();
+    updateRange(); saveVehicle(); invalidateRoutes(); // range/mpg feed step 2's plan
   } catch (err) { say(err.message, true); }
 });
-$('mpg').addEventListener('input', () => { updateRange(); saveVehicle(); });
+$('mpg').addEventListener('input', () => { updateRange(); saveVehicle(); invalidateRoutes(); });
 $('gal').addEventListener('input', () => {
   galEdited = true; $('tankNote').className = 'meta'; $('tankNote').textContent = '';
-  updateRange(); saveVehicle();
+  updateRange(); saveVehicle(); invalidateRoutes();
 });
 
 // Restore last pick from localStorage (or vOverride, a share-hash's v{} — see tripPayload):
@@ -1811,17 +1815,46 @@ $('shareBtn').addEventListener('click', async () => {
 // route.legs[] (raw OSRM) and waypoints (the geocoded {lat,lon,label} list) are also here.
 let currentTrip = null;
 
-async function run() {
+// Step 1's output, held here so step 2 (planBtn) and card selection can reach it without
+// threading it back through the DOM. ctx is captured once, at "Find routes" time — every
+// planning input it closes over (mpg, reserve, wind basis, ...) is re-read fresh on the next
+// "Find routes" click, which is also what invalidateRoutes forces after any of them change.
+let currentCandidates = null;
+let currentCtx = null;
+let selectedCandidateIndex = -1;
+
+// Bumped by invalidateRoutes, captured by findRoutes/planCandidate at entry. Any commit (state
+// write, DOM render, #planBtn.disabled) an async run makes — including from its own catch/finally
+// — must first confirm routesGeneration still equals what it captured; if not, some invalidation
+// happened while it was awaiting the network and its result is stale. One counter for both async
+// tails rather than a separate ad-hoc flag per call site.
+let routesGeneration = 0;
+
+// Clears step 1's corridors and step 2's plan together — they're either both current or both
+// stale, never one without the other, so there's exactly one teardown path for both. Wired to
+// every input that feeds discoverCandidatesFor or planCandidate (waypoints, vehicle, reserve,
+// start-fuel, mph-over, wind basis/date, fuel type — see their addEventListener calls below).
+// $price is deliberately not wired here: it only scales a display number at render time.
+function invalidateRoutes() {
+  routesGeneration++;
+  currentCandidates = null;
+  currentCtx = null;
+  selectedCandidateIndex = -1;
+  currentTrip = null;
+  $('planBtn').disabled = true;
+  clearPlanResults();
+}
+
+// Step 1: geocode the waypoints, discover route corridors, render them. Deliberately does not
+// touch Overpass or Photon — no station lookup happens until the user explicitly clicks "Plan
+// fuel stops" (planSelected) for whichever corridor is selected. Pre-selects the shortest so
+// step 2 is immediately actionable, but never plans it — a conditional auto-plan for the
+// single-corridor case is exactly the inconsistency (silent-until-second-click) that the old
+// combined run() produced for the multi-corridor case; two steps, uniformly, avoids it.
+async function findRoutes() {
   $('go').disabled = true;
-  $('stops').innerHTML = '';
-  $('econ').innerHTML = '';
-  $('wpInfo').innerHTML = '';
-  $('routeOptions').innerHTML = '';
-  $('cmpBtn').style.display = 'none';
-  $('compare').innerHTML = '';
-  $('exportOut').innerHTML = '';
-  clearPanelWarnings();
-  drawn.clearLayers();
+  invalidateRoutes();
+  const myGen = routesGeneration; // set by invalidateRoutes() just above — this run's ticket
   try {
     const baseMpg = vehicle().mpg;
     const rangeKm = vehicle().rangeMi * KM_PER_MI;
@@ -1852,23 +1885,25 @@ async function run() {
     say('Finding route options…');
     const candidates = await discoverCandidatesFor(pts0);
     if (!candidates.length) throw new Error('OSRM returned no usable route for these waypoints');
+    // An invalidating edit landed while discoverCandidatesFor was in flight — routesGeneration
+    // moved past myGen. These corridors were discovered for waypoints/inputs that no longer
+    // apply; bail before writing a single field or touching the DOM (defect: silently undoing
+    // the invalidation the edit just triggered).
+    if (routesGeneration !== myGen) return;
 
-    const ctx = { baseMpg, rangeKm, reserve, startFuel, overLimitMph, windBasis, windDate, forcedWps, fuelType };
-    // Always auto-plan the shortest corridor so one click always produces fuel stops — a
-    // multi-corridor result used to render a bare picker with nothing planned until a second
-    // click, which looked identical to a broken station lookup. planCandidate is still called
-    // exactly once here regardless of candidates.length, so this costs the same Overpass/
-    // Open-Meteo budget as the old single-corridor case; the picker lets the user replan a
-    // different corridor afterward at that corridor's own cost.
-    const bestI = pickBestCandidate(candidates);
-    renderOptions(candidates, ctx, bestI);
-    await planCandidate(candidates[bestI], ctx);
+    currentCandidates = candidates;
+    currentCtx = { baseMpg, rangeKm, reserve, startFuel, overLimitMph, windBasis, windDate, forcedWps, fuelType };
+    selectedCandidateIndex = pickBestCandidate(candidates);
+    renderOptions(candidates, selectedCandidateIndex);
+    $('planBtn').disabled = false;
+    say(`${candidates.length} route option${candidates.length === 1 ? '' : 's'} found — ` +
+      `pick one above, then click "Plan fuel stops".`);
     if (candidates.length > 1) {
-      $('compare').innerHTML = `${candidates.length} route options found — planned the shortest ` +
-        `(${candidates[bestI].label}). Pick a different one above to replan its stops.` +
+      $('compare').innerHTML = `${candidates.length} route options found — shortest is ` +
+        `preselected (${candidates[selectedCandidateIndex].label}).` +
         (candidates.length < 3 ? ' (Fewer than 3 distinct corridors survived — add a via-destination to force a different one.)' : '');
       // On demand, not eager: comparing every corridor means a full terrain+wind fetch per
-      // corridor (see compareCandidates) — firing that on every "Plan route" click is real
+      // corridor (see compareCandidates) — firing that on every "Find routes" click is real
       // Open-Meteo volume (measured: a 3-corridor comparison alone was the majority of a click's
       // requests) against a rate-limited, keyless API. Caching (elevCache/histCache) makes a
       // repeat click free, but a cold first click shouldn't pay for a comparison the user hasn't
@@ -1882,18 +1917,29 @@ async function run() {
       };
     }
   } catch (err) {
-    say(err.message, true);
+    if (routesGeneration === myGen) say(err.message, true); // stale run's own error isn't worth showing
   } finally {
-    $('go').disabled = false;
+    $('go').disabled = false; // "Find routes" is this call's own button — always safe to release it
   }
 }
 
-// Index of the corridor to auto-plan: the shortest by distance, first wins on an exact tie.
+// Step 2: plan fuel stops for whichever corridor is currently selected. No-op if step 1 hasn't
+// run (or its results were invalidated) — the button is disabled in that state anyway, this
+// guard just covers a stray call.
+async function planSelected() {
+  if (!currentCandidates || selectedCandidateIndex < 0) return;
+  await planCandidate(currentCandidates[selectedCandidateIndex], currentCtx);
+}
+
+// Index of the corridor to preselect after step 1: the shortest by distance, first wins on an
+// exact tie.
 function pickBestCandidate(candidates) {
   return candidates.reduce((best, c, i) => c.route.distance < candidates[best].route.distance ? i : best, 0);
 }
 
-function renderOptions(candidates, ctx, selectedIndex) {
+// Selecting a card only moves the selection (state + highlight) — it must never plan anything on
+// its own. planSelected (wired to #planBtn) is the only path into planCandidate.
+function renderOptions(candidates, selectedIndex) {
   const shortest = candidates.reduce((a, c) => Math.min(a, c.route.distance), Infinity);
   const shortestDur = candidates.find(c => c.route.distance === shortest).route.duration;
   $('routeOptions').innerHTML = candidates.map((c, i) => {
@@ -1905,10 +1951,10 @@ function renderOptions(candidates, ctx, selectedIndex) {
       <div class="meta">${mi(c.route.distance / 1000)} mi · ${(c.route.duration / 3600).toFixed(1)} h · ${cmp}</div>
     </div>`;
   }).join('');
-  [...$('routeOptions').children].forEach((el, i) => el.addEventListener('click', async () => {
+  [...$('routeOptions').children].forEach((el, i) => el.addEventListener('click', () => {
+    selectedCandidateIndex = i;
     [...$('routeOptions').children].forEach(o => o.classList.remove('sel'));
     el.classList.add('sel');
-    await planCandidate(candidates[i], ctx);
   }));
 }
 
@@ -1916,7 +1962,13 @@ function renderOptions(candidates, ctx, selectedIndex) {
 // only for the option the user picked — Overpass and Open-Meteo are never spent on candidates
 // that don't get chosen.
 async function planCandidate(candidate, { baseMpg, rangeKm, reserve, startFuel, overLimitMph, windBasis, windDate, forcedWps, fuelType }) {
-  $('go').disabled = true;
+  const myGen = routesGeneration;
+  // Generation covers invalidation (waypoint/vehicle/reserve/... edits); candidate-still-selected
+  // covers a card click, which moves selectedCandidateIndex without invalidating anything (see
+  // renderOptions). Either one makes this run's eventual result stale. Checked after every await
+  // below, before that section commits state, DOM, or map changes.
+  const current = () => routesGeneration === myGen && currentCandidates && currentCandidates[selectedCandidateIndex] === candidate;
+  $('planBtn').disabled = true;
   $('stops').innerHTML = '';
   $('econ').innerHTML = '';
   $('wpInfo').innerHTML = '';
@@ -1933,6 +1985,7 @@ async function planCandidate(candidate, { baseMpg, rangeKm, reserve, startFuel, 
     // single default route a plain request would give. A via-route (3+ coords) is unambiguous.
     const twoPoint = candidate.coords.length === 2;
     const routes = await fetchRoute(candidate.coords, twoPoint ? { overview: 'full', alternatives: true } : { overview: 'full' });
+    if (!current()) return; // a different card is selected now, or an edit invalidated this run
     const route = twoPoint
       ? routes.reduce((best, r) => Math.abs(r.distance - candidate.route.distance) < Math.abs(best.distance - candidate.route.distance) ? r : best)
       : routes[0];
@@ -1946,6 +1999,7 @@ async function planCandidate(candidate, { baseMpg, rangeKm, reserve, startFuel, 
 
     say('Checking terrain and wind…');
     const econ = await planEconomy(pts, cum, route, overLimitMph, windBasis, windDate);
+    if (!current()) return;
     renderEconomy(econ, baseMpg);
     const { sampleKm, adjCum } = econ;
     const adjTotalKm = adjCum[adjCum.length - 1];
@@ -1973,6 +2027,7 @@ async function planCandidate(candidate, { baseMpg, rangeKm, reserve, startFuel, 
     for (const fw of forcedWps) {
       say(`Looking for a fuel station near ${fw.label.split(',')[0]}…`);
       const station = await findForcedStation(fw, fuelType);
+      if (!current()) return;
       if (!station) {
         $('panel').insertAdjacentHTML('beforeend', `<div class="warn">No mapped fuel station within ` +
           `${fw.radiusMi} mi of ${fw.label.split(',')[0]} — try a larger radius.</div>`);
@@ -2004,6 +2059,7 @@ async function planCandidate(candidate, { baseMpg, rangeKm, reserve, startFuel, 
         windows.push([Math.round(toReal(d - legKm * 0.5)), Math.round(toReal(d) + 5)]);
 
       const raw = await fetchStations(pts, cum, windows);
+      if (!current()) return;
       if (!raw.length && !forcedStops.length) throw new Error('No gas stations found near this route in OpenStreetMap');
 
       // Each station carries both positions: `km` (fuel-adjusted) drives planStops below,
@@ -2044,9 +2100,15 @@ async function planCandidate(candidate, { baseMpg, rangeKm, reserve, startFuel, 
         `<div class="warn">Final leg is ${mi(finalLegReal)} mi — close to your ${mi(legKm)} mi usable range.</div>`);
     }
   } catch (err) {
-    say(err.message, true);
+    if (current()) say(err.message, true); // a stale run's own failure isn't worth showing
   } finally {
-    $('go').disabled = false;
+    // Button ownership is generation-only, not full current(): a run that's stale only because a
+    // *different card* got selected (candidate mismatch, generation unchanged — see defect 1) is
+    // still the sole thing that will ever flip #planBtn back on, since selecting a card doesn't
+    // touch it. Gating this on current() too would leave the button disabled forever in that case.
+    // A generation bump (invalidateRoutes, or the newer run it enabled) means some other run now
+    // owns the button, so this one must leave it alone.
+    if (routesGeneration === myGen) $('planBtn').disabled = false;
   }
 }
 
@@ -2105,7 +2167,7 @@ function drawEconLine(segments) {
 // Corridor comparison (need B): runs planEconomy for every discovered-but-unpicked option so the
 // user can weigh e.g. I-80/Wyoming (wind+speed) against I-70/Colorado (terrain) before choosing.
 // Costs only Open-Meteo (elevation+wind), never Overpass — see pointsFromSteps for why no extra
-// OSRM request is needed either. Triggered on demand (see run()'s #cmpBtn wiring), not eagerly —
+// OSRM request is needed either. Triggered on demand (see findRoutes()'s #cmpBtn wiring), not eagerly —
 // measured at up to 3 corridors x (elevation + WIND_HIST_YEARS-per-bucket historical wind)
 // requests, real volume against a keyless, rate-limited API. Cached (elevCache/histCache), so a
 // repeat click on the same corridors costs nothing new.
@@ -2232,9 +2294,18 @@ $('windBasis').addEventListener('change', () => {
     ? `A ${WIND_HIST_YEARS}-year average for that date — a climatology, not a forecast for that specific day.`
     : '';
 });
+$('windBasis').addEventListener('change', invalidateRoutes);
 
-$('go').addEventListener('click', run);
-$('panel').addEventListener('keydown', e => { if (e.key === 'Enter') run(); });
+// Every planning input except $price invalidates whatever step 1 already found: reserve/start-fuel/
+// mph-over/wind basis feed ctx (captured fresh on each "Find routes" click and reused as-is by step
+// 2), so an edit after that click would otherwise leave a plan on screen describing stale inputs.
+// $price only scales a display number at render time (see renderTripFuel) — never feeds routing or
+// planning — so it's deliberately left out here.
+['reserve', 'fuel', 'over', 'windDate'].forEach(id => $(id).addEventListener('input', invalidateRoutes));
+
+$('go').addEventListener('click', findRoutes);
+$('planBtn').addEventListener('click', planSelected);
+$('panel').addEventListener('keydown', e => { if (e.key === 'Enter') findRoutes(); });
 
 // --- self check: ?test=1 ---------------------------------------------------
 
@@ -2279,7 +2350,7 @@ if (new URLSearchParams(location.search).get('test')) {
 
   ok(planStops(stations, 400, 500, 500).stops.length === 0, 'short trip needs no stop');
 
-  // Vehicle range: mpg x gallons, then the same reserve/start-fuel math run() applies.
+  // Vehicle range: mpg x gallons, then the same reserve/start-fuel math findRoutes() applies.
   const r = vehicleRange(25, 12);
   ok(r === 300, `vehicleRange 25 mpg x 12 gal = ${r} mi`);
   const legRange = r * (1 - 0.15); // 15% reserve
@@ -2538,21 +2609,22 @@ if (new URLSearchParams(location.search).get('test')) {
   ok(keepAndLabel([soleRoute, absurdRoute]).length === 1,
     'a route over ABSURD_MULT x the shortest survivor is dropped');
 
-  // pickBestCandidate (silent two-click gate fix): run() used to plan nothing at all until a
-  // second click when 2+ corridors came back — see run(). It must pick the shortest by distance,
-  // first wins on a tie, and a single candidate is trivially its own answer.
+  // pickBestCandidate: preselects a corridor after step 1 renders — see findRoutes(). It must
+  // pick the shortest by distance, first wins on a tie, and a single candidate is trivially its
+  // own answer.
   const distCandidates = [{ route: { distance: 1559100 } }, { route: { distance: 1549600 } }, { route: { distance: 1633000 } }];
   ok(pickBestCandidate(distCandidates) === 1, `shortest of three candidates is picked, got index ${pickBestCandidate(distCandidates)}`);
   ok(pickBestCandidate([{ route: { distance: 500000 } }]) === 0, 'a single candidate is trivially "best" at index 0');
   const tiedCandidates = [{ route: { distance: 500000 } }, { route: { distance: 500000 } }];
   ok(pickBestCandidate(tiedCandidates) === 0, 'an exact distance tie keeps the first candidate, not the last');
 
-  // Integration: reproduces exactly what run() now does for a multi-corridor result
-  // (pickBestCandidate -> renderOptions -> planCandidate(candidates[bestI], ctx)) and checks the
-  // corridor count planned is exactly one — not zero (the original bug) and not all of them
-  // (would multiply Overpass/Open-Meteo cost by corridor count). planCandidate is swapped for a
-  // call-counting stub; it has no internal await so the push below is synchronous, no need to
-  // await the call.
+  // Integration: the explicit two-step flow end to end for a multi-corridor result — the
+  // inversion of the old combined run(), which auto-planned the shortest corridor on one click.
+  // Step 1 (pickBestCandidate -> renderOptions) must plan zero corridors; selecting a different
+  // card must only move the selection; step 2 (planSelected) must plan exactly the *selected*
+  // corridor, not the preselected one, not all of them. planCandidate is swapped for a
+  // call-counting stub; it has no internal await, so planSelected's `await planCandidate(...)`
+  // still pushes synchronously before it suspends — no need to await planSelected() itself.
   {
     const origPlanCandidate = planCandidate;
     const calls = [];
@@ -2562,17 +2634,131 @@ if (new URLSearchParams(location.search).get('test')) {
       { route: { distance: 1549600, duration: 49000 }, label: 'via I-70 / US-50', coords: [] },
       { route: { distance: 1633000, duration: 52000 }, label: 'via I-80 / US-191', coords: [] },
     ];
-    const bestI = pickBestCandidate(fixtureCandidates);
-    renderOptions(fixtureCandidates, {}, bestI);
-    planCandidate(fixtureCandidates[bestI], {});
+
+    // Step 1: renders corridors, preselects the shortest, plans nothing.
+    currentCandidates = fixtureCandidates;
+    currentCtx = {};
+    selectedCandidateIndex = pickBestCandidate(fixtureCandidates);
+    renderOptions(fixtureCandidates, selectedCandidateIndex);
+    ok(calls.length === 0, `step 1 plans zero corridors, got ${calls.length}`);
+    const selAfterStep1 = [...$('routeOptions').children].filter(el => el.classList.contains('sel'));
+    ok(selAfterStep1.length === 1 && selAfterStep1[0].dataset.i === String(selectedCandidateIndex),
+      'step 1 visibly preselects the shortest corridor');
+
+    // Selecting a different card moves the selection and still plans nothing.
+    const otherI = (selectedCandidateIndex + 1) % fixtureCandidates.length;
+    $('routeOptions').children[otherI].dispatchEvent(new Event('click', { bubbles: true }));
+    ok(selectedCandidateIndex === otherI, `clicking a card moves the selection to ${otherI}, got ${selectedCandidateIndex}`);
+    const selAfterClick = [...$('routeOptions').children].filter(el => el.classList.contains('sel'));
+    ok(selAfterClick.length === 1 && selAfterClick[0].dataset.i === String(otherI),
+      'the highlight follows the click, not left on the original preselection');
+    ok(calls.length === 0, `selecting a card still plans zero corridors, got ${calls.length}`);
+
+    // Step 2 plans exactly the selected corridor.
+    planSelected();
+    ok(calls.length === 1, `step 2 plans exactly one corridor, got ${calls.length}`);
+    ok(calls[0] === fixtureCandidates[otherI],
+      'step 2 plans the corridor the user selected, not the auto-preselected shortest one');
+
     planCandidate = origPlanCandidate;
-    ok(calls.length === 1, `exactly one corridor is planned for a multi-corridor result, got ${calls.length}`);
-    ok(calls[0] === fixtureCandidates[1], 'the planned corridor is the shortest one, not an arbitrary one');
-    const selEls = [...$('routeOptions').children].filter(el => el.classList.contains('sel'));
-    ok(selEls.length === 1 && selEls[0].dataset.i === String(bestI),
-      'the picker visibly marks the auto-planned corridor as selected, unambiguously tied to the shown stops');
     $('routeOptions').innerHTML = ''; // don't leak this fixture into real page state
   }
+
+  // Staleness: any planning-input edit after step 1 must invalidate both the held corridors and
+  // any plan, and lock step 2 out until step 1 runs again — see invalidateRoutes() and its
+  // addEventListener wiring on waypoints/mpg/gal/reserve/fuel/over/windBasis/windDate/fuelType/vtr.
+  {
+    currentCandidates = [{ route: { distance: 1, duration: 1 }, label: 'fixture', coords: [] }];
+    currentCtx = {};
+    selectedCandidateIndex = 0;
+    $('planBtn').disabled = false;
+    $('routeOptions').innerHTML = '<div class="opt sel" data-i="0">fixture</div>';
+    invalidateRoutes();
+    ok(currentCandidates === null && selectedCandidateIndex === -1, 'invalidateRoutes clears the held corridor/selection state');
+    ok($('planBtn').disabled, 'invalidateRoutes disables "Plan fuel stops"');
+    ok($('routeOptions').innerHTML === '', 'invalidateRoutes clears the rendered corridor picker');
+  }
+
+  // Async-staleness regression (three reviewed defects, one routesGeneration counter): fetchRoute/
+  // discoverCandidatesFor are swapped for manually-resolved promises so the test controls exactly
+  // when the async tail resumes relative to a simulated card click / invalidating edit — a
+  // controllable resolve order, not timing luck. Sequenced as one deferred check (not three
+  // separate top-level IIFEs) because the sub-tests share mutable module state
+  // (currentCandidates/selectedCandidateIndex/currentTrip/#planBtn) that must not interleave; a
+  // plain script has no top-level await, so — like mapConcurrentCheck above — "self checks passed"
+  // waits on it at the bottom of this block instead of firing immediately.
+  const staleRunChecks = (async () => {
+    const origFetchRoute = fetchRoute, origGeocode = geocode, origDiscover = discoverCandidatesFor;
+    const baseCtx = { rangeKm: 500, reserve: 0.15, startFuel: 1, forcedWps: [] };
+    const candA = { route: { distance: 1000 }, label: 'A', coords: [{ lat: 40, lon: -105 }, { lat: 41, lon: -104 }] };
+    const candB = { route: { distance: 900 }, label: 'B', coords: [{ lat: 40, lon: -105 }, { lat: 41, lon: -104 }] };
+
+    // Defect 1: A in flight, the user selects B (selectedCandidateIndex moves — no invalidation,
+    // routesGeneration unchanged) before A's fetchRoute resolves. A must not render, but since
+    // nothing else in the system will ever flip #planBtn back on for this generation (selecting a
+    // card doesn't touch it — see renderOptions), A's own finally still must, or the button is
+    // stuck disabled forever — the "critical" requirement, not optional.
+    {
+      let resolveFetch;
+      fetchRoute = () => new Promise(res => { resolveFetch = res; });
+      currentCandidates = [candA, candB]; currentCtx = baseCtx; selectedCandidateIndex = 0; currentTrip = null;
+      const p = planCandidate(candA, baseCtx);
+      selectedCandidateIndex = 1; // card click for B — renderOptions' handler, no invalidateRoutes
+      resolveFetch([{ distance: 1000, duration: 1, geometry: { coordinates: [] } }]);
+      await p;
+      ok(currentTrip === null, 'defect 1: A resolving after B is selected writes no state (currentTrip stays null)');
+      ok(!$('planBtn').disabled, 'defect 1: planBtn ends enabled — A bails on render but still releases the button it owns');
+    }
+
+    // Defect 2: A in flight, an invalidating edit (invalidateRoutes) lands before A resolves.
+    // routesGeneration has moved past what A captured, so A must not render AND must leave
+    // #planBtn exactly as invalidateRoutes left it (disabled) — that generation's button is now
+    // owned by invalidateRoutes/whatever run comes next, not by A.
+    {
+      let resolveFetch;
+      fetchRoute = () => new Promise(res => { resolveFetch = res; });
+      currentCandidates = [candA]; currentCtx = baseCtx; selectedCandidateIndex = 0; currentTrip = null;
+      const p = planCandidate(candA, baseCtx);
+      invalidateRoutes(); // simulates a waypoint/mpg/reserve/... edit landing mid-flight
+      resolveFetch([{ distance: 1000, duration: 1, geometry: { coordinates: [] } }]);
+      await p;
+      ok(currentTrip === null, 'defect 2: A resolving after invalidation writes no state (currentTrip stays null)');
+      ok($('planBtn').disabled, 'defect 2: planBtn stays disabled — invalidateRoutes owns it, not the stale run');
+    }
+    fetchRoute = origFetchRoute;
+
+    // Defect 3: findRoutes' own discoverCandidatesFor is in flight when an invalidating edit
+    // lands. Real field values are pinned first so this doesn't depend on whatever the page's
+    // vehicle/waypoint state happens to be; setTimeout(0) (a macrotask) — not a fixed count of
+    // microtask ticks — is what guarantees geocode's stubbed promises have fully drained and
+    // findRoutes is actually suspended on the controlled discoverCandidatesFor call before the
+    // test invalidates.
+    {
+      const savedWaypoints = waypoints;
+      const savedFields = ['mpg', 'gal', 'reserve', 'fuel', 'over', 'windBasis', 'windDate'].map(id => [id, $(id).value]);
+      waypoints = [mkWaypoint('Denver, CO'), mkWaypoint('Chicago, IL')];
+      $('mpg').value = '24'; $('gal').value = '15'; $('reserve').value = '15'; $('fuel').value = '100';
+      $('over').value = '0'; $('windBasis').value = 'live'; $('windDate').value = '';
+      geocode = async q => ({ lat: 39.7, lon: -105, label: q });
+      let resolveDiscover;
+      discoverCandidatesFor = () => new Promise(res => { resolveDiscover = res; });
+      currentCandidates = null; currentCtx = null; selectedCandidateIndex = -1;
+      $('routeOptions').innerHTML = ''; $('planBtn').disabled = true;
+
+      const p = findRoutes();
+      await new Promise(r => setTimeout(r, 0));
+      invalidateRoutes(); // the edit that should win
+      resolveDiscover([{ route: { distance: 111, duration: 1 }, label: 'stale-fixture', coords: [] }]);
+      await p;
+      ok(currentCandidates === null, 'defect 3: an invalidated findRoutes does not overwrite currentCandidates with stale corridors');
+      ok($('routeOptions').innerHTML === '', 'defect 3: an invalidated findRoutes does not render stale corridors');
+      ok($('planBtn').disabled, 'defect 3: planBtn stays disabled — invalidateRoutes owns it, not the stale findRoutes tail');
+
+      geocode = origGeocode; discoverCandidatesFor = origDiscover;
+      waypoints = savedWaypoints;
+      savedFields.forEach(([id, v]) => { $(id).value = v; });
+    }
+  })();
 
   // keepAndLabel + anchorAt: reproduces the real bug found while wiring up the anchor probe grid
   // (real OSRM data, Lakewood CO -> Fernley NV). An anchored Price-UT candidate shares so much
@@ -3083,7 +3269,7 @@ if (new URLSearchParams(location.search).get('test')) {
   ok(hoursBadgeHtml(photonStation.open) === '', 'a Photon-sourced station renders no 24/7 badge (open is always "")');
   ok(filterFuelType([photonStation], 'diesel').length === 1, 'a Photon-sourced station is never excluded by fuel type — unknown, not "no"');
 
-  mapConcurrentCheck.then(() => {
+  Promise.all([mapConcurrentCheck, staleRunChecks]).then(() => {
     console.log('%call self checks passed', 'color:green;font-weight:bold');
     say('Self checks passed — see console.');
   }).catch(err => {
