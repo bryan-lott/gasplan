@@ -1,0 +1,84 @@
+{
+  "build_date": "2026-08-14T16:53:04.577064+00:00",
+  "stations": {
+    "attribution": "\u00a9 OpenStreetMap contributors, ODbL 1.0 (https://www.openstreetmap.org/copyright)",
+    "license": "ODbL 1.0",
+    "build_date": "2026-08-14T16:52:58.422391+00:00",
+    "regions": [
+      "north-america/us",
+      "north-america/canada",
+      "north-america/mexico"
+    ],
+    "source_extract_dates": {
+      "north-america/us": "2026-08-13T20:21:01Z",
+      "north-america/canada": "2026-08-13T20:21:01Z",
+      "north-america/mexico": "2026-08-13T20:21:01Z"
+    },
+    "station_count_by_region": {
+      "north-america/us": 105148,
+      "north-america/canada": 12128,
+      "north-america/mexico": 9441
+    },
+    "station_count_total": 126717,
+    "dedupe_threshold_m": 40.0,
+    "wire_format": "binary_varint_v1",
+    "bytes_raw": 2334369,
+    "bytes_gzip9": 1079843,
+    "bytes_base64": 1439792,
+    "bytes_per_station_gzip_b64": 11.36
+  },
+  "geo": {
+    "roads": {
+      "attribution": "\u00a9 OpenStreetMap contributors, ODbL 1.0 (https://www.openstreetmap.org/copyright)",
+      "license": "ODbL 1.0",
+      "highways": [
+        "motorway",
+        "trunk"
+      ],
+      "labels": "ref kept, name dropped",
+      "tolerance_m": 1000,
+      "regions": [
+        "north-america/us",
+        "north-america/canada",
+        "north-america/mexico"
+      ],
+      "chain_count_by_region": {
+        "north-america/us": 60643,
+        "north-america/canada": 4186,
+        "north-america/mexico": 5484
+      },
+      "raw_way_count_by_region": {},
+      "chain_count_total": 70313,
+      "wire_format": "roads_varint_v1",
+      "bytes_raw": 1093098,
+      "bytes_gzip9": 791152,
+      "bytes_base64": 1054872
+    },
+    "boundaries": {
+      "attribution": "Made with Natural Earth. Free vector map data, public domain -- no attribution required (https://www.naturalearthdata.com/about/terms-of-use/)",
+      "license": "public domain",
+      "source_scale": "50m",
+      "layers": [
+        "admin-0 countries",
+        "admin-1 states/provinces",
+        "coastline"
+      ],
+      "filtered_to_iso3": [
+        "CAN",
+        "MEX",
+        "USA"
+      ],
+      "mexico_admin1_gap": "Natural Earth's 50m admin-1 (states/provinces) layer covers only 9 countries, and Mexico is not one of them -- this boundaries payload has a Mexico country outline but no Mexican state boundaries. That is a Natural Earth source-data gap at 50m, not a bug in this script; do not try to work around it.",
+      "topojson_quantization": 100000,
+      "toposimplify_flags": "-S 0.1 -f",
+      "feature_counts": {
+        "countries": 3,
+        "states": 64,
+        "coastline": 319
+      },
+      "bytes_raw": 92728,
+      "bytes_gzip9": 31104,
+      "bytes_base64": 41472
+    }
+  }
+}
