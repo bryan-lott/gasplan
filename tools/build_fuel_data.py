@@ -48,18 +48,19 @@ small filtered files remain on disk after that.
 import argparse
 import base64
 import gzip
-import io
 import json
 import math
 import os
 import re
 import shutil
-import struct
 import subprocess
 import sys
 import time
 import urllib.request
 from datetime import datetime, timezone
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from varint import write_uvarint, zigzag, unzigzag, write_str, read_uvarint, read_str, gzip9
 
 GEOFABRIK_BASE = "https://download.geofabrik.de"
 DEFAULT_REGIONS = ["north-america/us", "north-america/canada", "north-america/mexico"]
@@ -259,41 +260,9 @@ def dedupe(raw, thresh_m=DEDUPE_THRESH_M):
 
 # ---------------------------------------------------------------------------
 # Binary wire format encode/decode (encode = encode.py's build_binary, exact)
+# varint/zigzag/gzip9 primitives now live in varint.py, shared with
+# build_geo_data.py -- see that module for the shared docstring.
 # ---------------------------------------------------------------------------
-
-def write_uvarint(buf, n):
-    while True:
-        b = n & 0x7F
-        n >>= 7
-        if n:
-            buf.append(b | 0x80)
-        else:
-            buf.append(b)
-            return
-
-
-def zigzag(n):
-    return (n << 1) ^ (n >> 63) if n < 0 else (n << 1)
-
-
-def unzigzag(n):
-    return (n >> 1) if (n & 1) == 0 else -((n + 1) >> 1)
-
-
-def write_str(buf, s):
-    b = (s or "").encode("utf-8")
-    write_uvarint(buf, len(b))
-    buf.extend(b)
-
-
-def gzip9(data):
-    """gzip -9 with mtime pinned to 0 so identical input always produces
-    identical output bytes (plain gzip.compress() bakes in wall-clock time)."""
-    buf = io.BytesIO()
-    with gzip.GzipFile(fileobj=buf, mode="wb", compresslevel=9, mtime=0) as f:
-        f.write(data)
-    return buf.getvalue()
-
 
 def fuel_bits(fuel):
     bits = 0
@@ -339,24 +308,6 @@ def encode_binary(stations):
         write_str(buf, s["name"])
         write_str(buf, s["opening_hours"])
     return bytes(buf)
-
-
-def read_uvarint(b, pos):
-    result = shift = 0
-    while True:
-        byte = b[pos[0]]
-        pos[0] += 1
-        result |= (byte & 0x7F) << shift
-        if not (byte & 0x80):
-            return result
-        shift += 7
-
-
-def read_str(b, pos):
-    n = read_uvarint(b, pos)
-    s = b[pos[0]:pos[0] + n].decode("utf-8")
-    pos[0] += n
-    return s
 
 
 def decode_binary(b):

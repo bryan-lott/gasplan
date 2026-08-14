@@ -146,6 +146,15 @@ jobs:
           sudo apt-get install -y osmium-tool
           osmium --version
 
+      # pyshp parses the Natural Earth shapefiles for the boundaries payload.
+      # The TopoJSON steps run through `npx --yes -p topojson-server@3` /
+      # `topojson-simplify@3`, which fetch on demand -- node is preinstalled
+      # on ubuntu-latest, so there is nothing to install for those.
+      - name: Install Python build dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install pyshp
+
       # One download per region: stations, then roads, from the same pbf,
       # before it's deleted -- then the next region. Keeps peak disk usage
       # to roughly one region's extract (US, ~11.2GB) at a time.
