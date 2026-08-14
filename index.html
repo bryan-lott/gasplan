@@ -2438,6 +2438,17 @@ function dropNearForced(stations, forcedStops) {
   return stations.filter(s => forcedStops.every(f => Math.abs(s.realKm - f.realKm) > FORCED_DEDUPE_KM));
 }
 
+// Visible (not console-only) message for a forced stop whose own radius search came up empty —
+// naming the waypoint and the radius rather than dropping the request silently. Applies the same
+// at every waypoint position, including an endpoint (e.g. no station within 5 mi of Black Rock
+// City — the motivating case: there just isn't one near the playa, and saying so is the point of
+// honoring the flag at all). Pulled out of planCandidate so it's checkable without DOM/network.
+function forcedStopMissHtml(fw, forceOverpass) {
+  return `<div class="warn">No ${forceOverpass ? 'mapped' : 'embedded-dataset'} fuel station within ` +
+    `${fw.radiusMi} mi of ${fw.label.split(',')[0]} — try a larger radius` +
+    `${forceOverpass ? '' : ', or "Refresh stations from Overpass" if you have a connection'}.</div>`;
+}
+
 // Samples the route, fetches terrain/wind, and turns them into a fuel-adjusted distance axis.
 // Never throws: a failed Open-Meteo call degrades that one effect to "no adjustment" and gets
 // reported in `notes`, so a weather-API outage never blocks stop planning.
@@ -2572,6 +2583,15 @@ function insertWaypoint(list, index, item = '') {
 // with it for free, same as moveWaypoint/insertWaypoint already do. Reversing twice is therefore
 // exactly the identity, not just approximately (see self-check).
 function reverseTrip(list) { return [...list].reverse(); }
+
+// Which geocoded waypoints carry a forced ("refuel here") stop — every position, including the
+// first and the last. An endpoint flag reads a little oddly (origin: top off on the way out;
+// destination: fuel up right before arrival) but honoring it beats the old silent no-op where
+// ticking the box on an endpoint did nothing at all (see report). Kept as its own function so
+// "which waypoints qualify" is one testable point instead of inline array-filter logic.
+function forcedWaypoints(pts, wps) {
+  return pts.map((p, i) => ({ ...p, refuel: wps[i].refuel, radiusMi: wps[i].radiusMi })).filter(w => w.refuel);
+}
 
 // --- UI --------------------------------------------------------------------
 
@@ -2748,18 +2768,17 @@ function renderWaypoints() {
       <button type="button" class="dn" data-i="${i}" title="move down" ${i === waypoints.length - 1 ? 'disabled' : ''}>▼</button>
       <button type="button" class="ins" data-i="${i}" title="insert">+</button>
       ${waypoints.length > 2 ? `<button type="button" class="rm" data-i="${i}" title="remove">×</button>` : ''}`;
-    // Only an intermediate waypoint (not the start, not the final destination) can carry a
-    // forced stop — the start has no "arrive with" fuel state yet, and the destination has
-    // nothing left to drive that a forced fill would protect.
-    const mid = i > 0 && i < waypoints.length - 1;
-    const refuelRow = mid ? `
+    // Every waypoint can carry a forced stop now, including the start and the final destination
+    // — an endpoint checkbox is honored as "top off on the way out" / "fuel up right before
+    // arrival" rather than silently ignored (see forcedWaypoints).
+    const refuelRow = `
     <div class="wp-row" style="margin-top:2px;align-items:center">
       <label style="flex:none;display:flex;align-items:center;gap:4px;font-size:12px;color:var(--mut)">
         <input type="checkbox" class="wp-refuel" data-i="${i}" style="width:auto" ${w.refuel ? 'checked' : ''}> refuel here
       </label>
       <input class="wp-radius" data-i="${i}" type="number" min="1" value="${w.radiusMi}" title="search radius, miles"
         style="max-width:70px;${w.refuel ? '' : 'display:none'}">
-    </div>` : '';
+    </div>`;
     return `
     <div class="wp-block">
       <div class="wp-row">
@@ -3071,12 +3090,11 @@ async function findRoutes() {
 
     say('Finding waypoints…');
     const pts0 = await Promise.all(queries.map(geocode));
-    // Forced ("refuel here") stops: only an intermediate waypoint qualifies (not the start,
-    // not the final destination — see renderWaypoints), carried alongside its geocoded
+    // Forced ("refuel here") stops: any waypoint qualifies, including the start and the final
+    // destination (see forcedWaypoints/renderWaypoints) — carried alongside its geocoded
     // lat/lon/label so planCandidate never has to re-match it against candidate.coords (which
     // may include a corridor-discovery anchor point that isn't a user waypoint — see discoverCandidatesChain).
-    const forcedWps = pts0.map((p, i) => ({ ...p, refuel: activeWps[i].refuel, radiusMi: activeWps[i].radiusMi }))
-      .filter((w, i) => i > 0 && i < pts0.length - 1 && w.refuel);
+    const forcedWps = forcedWaypoints(pts0, activeWps);
 
     say('Finding route options…');
     const candidates = await discoverCandidatesFor(pts0);
@@ -3248,9 +3266,7 @@ async function planCandidate(candidate, { baseMpg, rangeKm, reserve, startFuel, 
         station = findForcedStationEmbedded(fw, fuelType);
       }
       if (!station) {
-        $('panel').insertAdjacentHTML('beforeend', `<div class="warn">No ${forceOverpass ? 'mapped' : 'embedded-dataset'} fuel station within ` +
-          `${fw.radiusMi} mi of ${fw.label.split(',')[0]} — try a larger radius` +
-          `${forceOverpass ? '' : ', or "Refresh stations from Overpass" if you have a connection'}.</div>`);
+        $('panel').insertAdjacentHTML('beforeend', forcedStopMissHtml(fw, forceOverpass));
         continue;
       }
       const proj = project([station.lat, station.lon], pts, cum);
@@ -4617,6 +4633,69 @@ if (new URLSearchParams(location.search).get('test')) {
   ok(!!gapPlan.gap, 'an unreachable stretch after the forced stop still reports a gap, not a silent skip');
   ok(gapPlan.gap[0] === 300 && gapPlan.gap[1] === 800, `gap offset onto the whole-route axis: ${gapPlan.gap}`);
   ok(gapPlan.stops.length === 1 && gapPlan.stops[0].forced, 'the forced stop itself still appears even though the leg after it fails');
+
+  // Endpoint forced stops (the fix): ticking "refuel here" on the first or last waypoint used to
+  // be a silent no-op (only an intermediate waypoint reached the old filter) — now every position
+  // qualifies. forcedWaypoints is the single filter point the old i>0 && i<length-1 logic lived
+  // in, so this exercises the actual fix, not just the generic partitioning it now reuses.
+  const geoPts = [
+    { lat: 39.7047, lon: -105.0814, label: 'Lakewood, CO' },
+    { lat: 39.6083, lon: -119.2519, label: 'Fernley, NV' },
+    { lat: 40.7864, lon: -119.2065, label: 'Black Rock City, NV' },
+  ];
+  const wpsOriginOnly = [{ refuel: true, radiusMi: 10 }, { refuel: false, radiusMi: 10 }, { refuel: false, radiusMi: 10 }];
+  const originForced = forcedWaypoints(geoPts, wpsOriginOnly);
+  ok(originForced.length === 1 && originForced[0].label === 'Lakewood, CO',
+    `a flagged origin now produces a forced stop instead of silence: ${JSON.stringify(originForced.map(w => w.label))}`);
+
+  const wpsDestOnly = [{ refuel: false, radiusMi: 10 }, { refuel: false, radiusMi: 10 }, { refuel: true, radiusMi: 5 }];
+  const destForced = forcedWaypoints(geoPts, wpsDestOnly);
+  ok(destForced.length === 1 && destForced[0].label === 'Black Rock City, NV' && destForced[0].radiusMi === 5,
+    `a flagged destination now produces a forced stop, radius carried through: ${JSON.stringify(destForced[0])}`);
+
+  const wpsMidOnly = [{ refuel: false, radiusMi: 10 }, { refuel: true, radiusMi: 8 }, { refuel: false, radiusMi: 10 }];
+  ok(forcedWaypoints(geoPts, wpsMidOnly).length === 1 && forcedWaypoints(geoPts, wpsMidOnly)[0].label === 'Fernley, NV',
+    'an intermediate flag still works exactly as before the fix');
+
+  const wpsBoth = [{ refuel: true, radiusMi: 10 }, { refuel: false, radiusMi: 10 }, { refuel: true, radiusMi: 5 }];
+  ok(forcedWaypoints(geoPts, wpsBoth).length === 2, `both endpoints flagged at once produces two forced waypoints: ${forcedWaypoints(geoPts, wpsBoth).length}`);
+
+  const wpsNone = geoPts.map(() => ({ refuel: false, radiusMi: 10 }));
+  ok(forcedWaypoints(geoPts, wpsNone).length === 0, 'no flags set produces no forced waypoints');
+
+  // No station within an endpoint's radius: forcedStopMissHtml must say so visibly, not silently
+  // drop it — the motivating example (no fuel within 5 mi of the Black Rock City playa).
+  const missHtml = forcedStopMissHtml({ label: 'Black Rock City, NV', radiusMi: 5 }, false);
+  ok(missHtml.includes('class="warn"'), 'no-station-in-radius message renders as a visible warning div, not console-only');
+  ok(missHtml.includes('5 mi of Black Rock City'), `message names the waypoint and its radius: ${missHtml}`);
+  const missHtmlOverpass = forcedStopMissHtml({ label: 'Black Rock City, NV', radiusMi: 5 }, true);
+  ok(missHtmlOverpass.includes('No mapped fuel station'), `the Overpass path uses "mapped" wording, not "embedded-dataset": ${missHtmlOverpass}`);
+
+  // Zero-length sub-leg edge cases: a forced stop can now land exactly at mile 0 (a flagged
+  // origin) or exactly at the destination (a flagged destination) — planStopsPartitioned must
+  // not divide by zero or throw on a zero-length segment either side of it.
+  const forcedAtZero = { name: 'origin-station', km: 0, realKm: 0, forced: true };
+  const zeroStartPlan = planStopsPartitioned([], [forcedAtZero], 500, 0, 500);
+  ok(zeroStartPlan.stops.length === 1 && zeroStartPlan.stops[0].forced && zeroStartPlan.finalLeg === 500,
+    `a forced stop at km 0 collapses to a zero-length first sub-leg without erroring: ${JSON.stringify(zeroStartPlan)}`);
+
+  const forcedAtEnd = { name: 'dest-station', km: 500, realKm: 500, forced: true };
+  const zeroEndPlan = planStopsPartitioned([], [forcedAtEnd], 500, 500, 500);
+  ok(zeroEndPlan.stops.length === 1 && zeroEndPlan.stops[0].forced && zeroEndPlan.finalLeg === 0,
+    `a forced stop at the destination collapses to a zero-length final sub-leg without erroring: ${JSON.stringify(zeroEndPlan)}`);
+
+  // Both endpoints flagged on a short trip: planCandidate sorts forced stops by km before handing
+  // them to planStopsPartitioned, so even a "crossing" pair (an endpoint's nearest station lands
+  // past the other endpoint's, on a short or looping route) arrives here already ordered — bounds
+  // stay monotonic and no sub-leg goes negative.
+  const crossedForced = [
+    { name: 'dest-side', km: 50, realKm: 50, forced: true },    // destination's nearest station, but earlier along the route
+    { name: 'origin-side', km: 450, realKm: 450, forced: true }, // origin's nearest station, but later along the route
+  ].sort((a, b) => a.km - b.km); // what planCandidate does before calling planStopsPartitioned
+  const crossedPlan = planStopsPartitioned([], crossedForced, 500, 500, 500);
+  ok(crossedPlan.stops.length === 2 && crossedPlan.stops.every(s => s.forced),
+    `both endpoints forced on a short trip still produce two ordered stops: ${crossedPlan.stops.map(s => s.name)}`);
+  ok(crossedPlan.stops[0].km <= crossedPlan.stops[1].km, 'sorting by km first keeps sub-leg bounds monotonic, no negative segment');
 
   // Requirement 5: fuel accounting through a forced stop — fuelAtWaypoints treats it as just
   // another refill event, and the trip total stays axis-only (unaffected by where stops land).
