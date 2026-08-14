@@ -3,3 +3,10 @@
 .idea/
 *.swp
 node_modules/
+__pycache__/
+
+# tools/build_fuel_data.py output -- OSM downloads, checkpoints, and the
+# base64 payload. Never committed; the GitHub Actions workflow builds this
+# in-runner and carries it only in the Pages deploy artifact / cache.
+build/
+_site/

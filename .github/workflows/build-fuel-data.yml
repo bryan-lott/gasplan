@@ -1,0 +1,159 @@
+name: Build fuel data and deploy Pages
+
+# Monthly refresh of the North America gas-station dataset baked into
+# index.html, plus redeploy on every push to main. The multi-GB OSM
+# download/build only actually runs once a month (or on manual force) --
+# see the cache step below. The built payload is never committed to git;
+# it lives only in the workflow cache and the deploy-pages artifact.
+#
+# Requires repo Settings -> Pages -> Source = "GitHub Actions"
+# (NOT "Deploy from a branch" -- that setting is unaffected by this
+# workflow and must be switched manually by the repo owner once).
+
+on:
+  schedule:
+    - cron: "17 9 1 * *" # 09:17 UTC on the 1st of each month
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: "Force a fresh OSM download/build even if this month's payload is already cached"
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  actions: write # needed to delete/replace a cache entry on forced rebuilds
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute this month's cache key
+        id: key
+        run: echo "ym=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+
+      # Cache is keyed purely by year-month. A normal push within the same
+      # month restores this and skips straight to injection -- no download,
+      # no osmium. Only the first push after a new month rolls over (before
+      # that month's cron fires), a manual force_rebuild, or the monthly
+      # cron itself will trigger the heavy path below.
+      - name: Restore cached payload
+        id: restore
+        uses: actions/cache/restore@v4
+        with:
+          path: build/out
+          key: fuel-data-${{ steps.key.outputs.ym }}
+
+      - name: Decide whether a full rebuild is needed
+        id: decide
+        run: |
+          need=false
+          [ "${{ steps.restore.outputs.cache-hit }}" != "true" ] && need=true
+          [ "${{ github.event_name }}" = "schedule" ] && need=true
+          [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force_rebuild }}" = "true" ] && need=true
+          echo "need_build=$need" >> "$GITHUB_OUTPUT"
+          echo "cache miss or forced rebuild: $need"
+
+      # us-latest.osm.pbf is ~11.2GB, canada-latest.osm.pbf ~6.0GB. A
+      # standard ubuntu-latest runner has ~84GB disk but only ~14GB free
+      # by default because of preinstalled toolchains -- reclaim room
+      # before downloading anything multi-GB.
+      - name: Free up runner disk space
+        if: steps.decide.outputs.need_build == 'true'
+        run: |
+          echo "before:"; df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}" 2>/dev/null || true
+          sudo docker image prune -a -f >/dev/null 2>&1 || true
+          echo "after:"; df -h /
+
+      # Ubuntu's apt osmium-tool is typically a version or two behind the
+      # homebrew build used for local development; `tags-filter` and
+      # `export` have been stable across versions for years, but pin/bump
+      # here if CI ever diverges in observed behavior from local runs.
+      - name: Install osmium-tool
+        if: steps.decide.outputs.need_build == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y osmium-tool
+          osmium --version
+
+      - name: Build fuel data payload (downloads US + Canada + Mexico extracts)
+        if: steps.decide.outputs.need_build == 'true'
+        run: |
+          python3 tools/build_fuel_data.py \
+            --work-dir "${RUNNER_TEMP}/fuel-work" \
+            --out-dir build/out
+
+      - name: Replace stale cache entry (cache keys are immutable, so delete before re-saving)
+        if: steps.decide.outputs.need_build == 'true' && steps.restore.outputs.cache-hit == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh cache delete "fuel-data-${{ steps.key.outputs.ym }}" || true
+
+      - name: Save payload to cache
+        if: steps.decide.outputs.need_build == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: build/out
+          key: fuel-data-${{ steps.key.outputs.ym }}
+
+      # ---- Injection contract ----
+      # index.html (owned by the front-end agent) contains exactly one line:
+      #   const FUEL_DATA_B64 = "/*FUEL_DATA_PLACEHOLDER*/";
+      # i.e. the marker sits *inside* the existing string quotes (confirmed
+      # by reading index.html directly -- see also its own self-test at
+      # decodeFuelData(FUEL_DATA_B64) === null for the un-injected value).
+      # This step swaps the bare marker token for the base64 characters only
+      # -- no extra quotes added, the surrounding "..." already there stay.
+      # If that convention ever changes, this is the one place to edit.
+      - name: Inject payload into index.html placeholder
+        run: |
+          test -f build/out/payload_b64.txt || { echo "::error::build/out/payload_b64.txt missing (cache restore and build both failed to produce it)"; exit 1; }
+          mkdir -p _site
+          cp index.html _site/index.html
+          python3 - <<'PY'
+          import pathlib
+          html = pathlib.Path("_site/index.html").read_text()
+          b64 = pathlib.Path("build/out/payload_b64.txt").read_text().strip()
+          marker = "/*FUEL_DATA_PLACEHOLDER*/"
+          if marker not in html:
+              raise SystemExit(
+                  f"::error::Placeholder {marker!r} not found in index.html. "
+                  "The front-end's marker convention has changed -- update this "
+                  "step's `marker` value or replacement logic to match."
+              )
+          html = html.replace(marker, b64, 1)
+          pathlib.Path("_site/index.html").write_text(html)
+          print(f"injected {len(b64)} bytes of base64 payload into _site/index.html")
+          PY
+
+      - name: Show manifest
+        run: cat build/out/manifest.json
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
