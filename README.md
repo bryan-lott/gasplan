@@ -11,6 +11,34 @@ Gasplan works in two ways:
 
 No server, no build step, no API keys required.
 
+## Embedded Offline Data
+
+> **A plain `git clone` of this repository does NOT include the embedded fuel-station, road, and boundary data.** The deployed site at https://bryan-lott.github.io/gasplan/ has this data baked in for offline-capable use, but that data lives on a separate `data` branch, not on `main`. If you clone `main` and open `index.html` locally without an extra step, the app still works — it just falls back to live Overpass API queries for gas stations and skips the offline road/boundary overlays, same as any browser that doesn't support the decoder.
+
+The `data` branch is maintained by the `Refresh fuel data` GitHub Actions workflow (`.github/workflows/refresh-fuel-data.yml`), which runs monthly (or on manual dispatch) and rebuilds it from OpenStreetMap (via Geofabrik extracts) and Natural Earth. Each run **force-pushes a single new commit** to `data`, replacing the previous one outright — this keeps repository growth bounded (one payload's worth of history, forever) rather than accumulating a new multi-hundred-KB commit every month.
+
+**To pull the embedded data down for local development:**
+
+```bash
+git fetch origin data:data
+git show data:data/fuel-na.b64 > data/fuel-na.b64
+git show data:data/roads-na.b64 > data/roads-na.b64
+git show data:data/boundaries-na.b64 > data/boundaries-na.b64
+git show data:data/manifest.json > data/manifest.json
+```
+
+Then run `tools/build_fuel_data.py`'s CI injection step locally (see that script and `.github/workflows/deploy-pages.yml`) to bake the fetched payloads into a local copy of `index.html`, or just open `index.html` as-is and let it fall back to Overpass — both are supported.
+
+**If you skip this step:** the app still builds and runs a fully working page. It just has no embedded data, so gas-station lookups go through the live Overpass API (same as always) and there is no offline road/boundary overlay. Nothing breaks; you simply don't get the baked-in dataset.
+
+**Important — the `data` branch is force-pushed on every refresh.** It is not an append-only history: each refresh discards the previous commit entirely and replaces it. Do not branch from `data`, base a PR on it, or expect `git log` on it to show anything but the single latest payload commit. If you've fetched it before and fetch again after a refresh, `git fetch origin data:data` will fail with a non-fast-forward error — that's expected; re-fetch with `git fetch origin +data:data` (or delete and re-fetch your local `data` branch) to force your local copy to match.
+
+**Forks:** GitHub Actions on a fork cannot deploy with embedded data out of the box, because a fork does not automatically get the upstream `data` branch. Pick one:
+1. **Copy the branch once:** `git fetch https://github.com/bryan-lott/gasplan.git data:data && git push --force <your-fork-url> data`. Your fork's Pages deploy will then have data until you refresh it yourself.
+2. **Run your own refresh:** trigger your fork's own `Refresh fuel data` workflow (Actions tab → Refresh fuel data → Run workflow). It builds and force-pushes a `data` branch on your fork directly, independent of upstream.
+
+Either way, your fork's deploy workflow (`.github/workflows/deploy-pages.yml`) will pick up whatever `data` branch exists in the fork — it never reads upstream's.
+
 ## Features
 
 - **Multiple waypoints**: Enter a start location and any number of destinations in order, with the ability to reorder them or insert new stops mid-route.

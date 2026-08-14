@@ -427,7 +427,7 @@ def region_tag(region):
     return region.strip("/").replace("/", "_")
 
 
-def process_region(region, work_dir, force, min_free_margin):
+def process_region(region, work_dir, force, min_free_margin, keep_pbf=False):
     tag = region_tag(region)
     checkpoint = os.path.join(work_dir, f"stations__{tag}.json")
     meta_path = os.path.join(work_dir, f"meta__{tag}.json")
@@ -447,9 +447,17 @@ def process_region(region, work_dir, force, min_free_margin):
     geojsonseq = tags_filter_and_export(pbf_path, work_dir, tag)
 
     # The big national/provincial pbf is the only multi-GB file on disk;
-    # delete it now that osmium has produced the tiny filtered outputs.
-    os.remove(pbf_path)
-    print(f"[{region}] deleted {pbf_path} to free disk space", file=sys.stderr)
+    # delete it now that osmium has produced the tiny filtered outputs --
+    # unless a sibling roads/geo extraction (tools/build_geo_data.py, see
+    # its --work-dir contract) still needs to read amenity=fuel's sibling
+    # highway=motorway/trunk ways out of the SAME pbf before it's gone.
+    # --keep-pbf defers deletion to that later step so the multi-GB file is
+    # only ever downloaded once per region.
+    if keep_pbf:
+        print(f"[{region}] --keep-pbf set, leaving {pbf_path} on disk for a sibling extractor", file=sys.stderr)
+    else:
+        os.remove(pbf_path)
+        print(f"[{region}] deleted {pbf_path} to free disk space", file=sys.stderr)
 
     raw = load_raw_stations(geojsonseq)
     merged = dedupe(raw)
@@ -473,6 +481,10 @@ def main():
     ap.add_argument("--work-dir", default="build/work", help="Scratch dir for downloads/checkpoints.")
     ap.add_argument("--out-dir", default="build/out", help="Where payload_b64.txt and manifest.json go.")
     ap.add_argument("--force", action="store_true", help="Redo regions even if a checkpoint exists.")
+    ap.add_argument("--keep-pbf", action="store_true",
+                     help="Don't delete each region's downloaded .osm.pbf after the stations tags-filter "
+                          "pass -- leaves it in --work-dir for tools/build_geo_data.py to extract roads "
+                          "from (same file, no second download). That script deletes the pbf when done.")
     ap.add_argument("--min-free-margin", type=float, default=1.15,
                      help="Required free disk as a multiple of the download size (default 1.15 = 15%% headroom).")
     args = ap.parse_args()
@@ -487,7 +499,7 @@ def main():
     per_region = {}
     source_dates = {}
     for region in regions:
-        stations, source_date = process_region(region, args.work_dir, args.force, args.min_free_margin)
+        stations, source_date = process_region(region, args.work_dir, args.force, args.min_free_margin, args.keep_pbf)
         all_stations.extend(stations)
         per_region[region] = len(stations)
         if source_date:

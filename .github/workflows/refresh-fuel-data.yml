@@ -1,0 +1,244 @@
+name: Refresh fuel data
+
+# Monthly rebuild of the North America fuel-station, motorway/trunk-road, and
+# country/state-boundary data from OpenStreetMap (Geofabrik extracts, us
+# ~11.25 GiB / canada ~5.97 GiB / mexico ~0.60 GiB) and Natural Earth. Builds
+# three payloads and force-pushes them as the SINGLE commit on an orphan
+# `data` branch -- each refresh replaces that commit outright, so the
+# payload never accumulates in any branch's history and repo growth is
+# bounded at one set of payloads forever.
+#
+# `main` is NEVER touched by this workflow -- not committed to, not rebased,
+# not force-pushed. Its history stays a normal append-only log. The payload
+# lives only on `data`, which deploy-pages.yml fetches at deploy time (see
+# that workflow) and README.md documents for anyone cloning locally.
+#
+# Runs only on a schedule or manual dispatch -- NEVER on push -- so this
+# workflow's own push can never trigger another run of itself. A push made
+# with the default GITHUB_TOKEN also does not itself fire push-triggered
+# workflows (GitHub's own loop-prevention rule), so deploy-pages.yml would
+# NOT pick up the new payload automatically -- the last step below dispatches
+# it explicitly instead. That dispatch is the one and only edge from
+# refresh -> deploy; there is no edge from refresh -> refresh.
+#
+# Consequences of this design (accepted tradeoffs, not bugs -- see README.md
+# for the user-facing version of this):
+#  - `git clone` of main alone does not include the payload; README.md
+#    documents `git fetch origin data:data` to get it.
+#  - Payload history is intentionally discarded -- last month's payload
+#    cannot be checked out or diffed against; only the current one exists.
+#  - GitHub does not reclaim unreachable objects (the previous payload
+#    commit/blob) immediately after a force-push, so the repo's reported
+#    size can lag behind the bounded steady-state size for a while.
+#  - A fork's own Actions can't deploy with data unless the fork also has
+#    a `data` branch (via `git push --force <fork-url> data`) or runs its
+#    own copy of this workflow first (README.md spells out both).
+#
+# ---- Payload interface (stations exists today; roads/boundaries are a
+# follow-up -- tools/build_geo_data.py does not exist yet) ----
+#
+# tools/build_fuel_data.py (existing, station payload -- one new flag added
+# alongside this workflow):
+#   python3 tools/build_fuel_data.py --regions <csv> --work-dir <dir> \
+#       --out-dir <dir> [--force] [--keep-pbf]
+#   --keep-pbf: don't delete a region's downloaded .osm.pbf after the
+#   stations tags-filter pass -- leaves it in --work-dir for the roads build
+#   below to read (same file, no second download). Already implemented.
+#   Output: <out-dir>/payload_b64.txt, <out-dir>/manifest.json (unchanged).
+#
+# tools/build_geo_data.py (NEW -- to be implemented by a follow-up task,
+# not by this workflow's author; interface specified here so that task can
+# build directly against it):
+#   python3 tools/build_geo_data.py --regions <csv> --work-dir <dir> \
+#       --out-dir <dir> [--force] [--tolerance-m 1000] [--skip-boundaries]
+#   Roads: expects <work-dir>/<region_tag>.osm.pbf to already exist for
+#   every requested region (produced by the build_fuel_data.py --keep-pbf
+#   run just before it, same --work-dir) -- must error clearly rather than
+#   downloading a second copy if a pbf is missing. Filters
+#   highway=motorway,trunk from that same pbf, merges way fragments,
+#   Douglas-Peucker simplifies at --tolerance-m (default 1000m), keeps
+#   `ref`, drops `name`. Deletes each region's pbf once its roads
+#   extraction is checkpointed (mirrors build_fuel_data.py's own disk
+#   mitigation -- this script is the last consumer of the pbf, so it owns
+#   final cleanup). Checkpoints per region the same way build_fuel_data.py
+#   does (e.g. <work-dir>/roads__<tag>.json), so a later combine-only
+#   invocation across all regions (no pbf needed) just concatenates.
+#   Boundaries: independent of --regions/pbfs entirely -- downloads Natural
+#   Earth 50m admin-0 countries + admin-1 states/provinces + coastline
+#   (public domain, small download, no disk-headroom risk), filters to
+#   USA/CAN/MEX, encodes as quantized TopoJSON. Skip with --skip-boundaries
+#   (used during the per-region loop below so it only runs once).
+#   Output: <out-dir>/roads_b64.txt, <out-dir>/boundaries_b64.txt,
+#   <out-dir>/geo_manifest.json.
+#
+# ---- Committed payload filenames (on the `data` branch, path data/) ----
+#   data/fuel-na.b64        -- stations, from payload_b64.txt
+#   data/roads-na.b64       -- roads, from roads_b64.txt
+#   data/boundaries-na.b64  -- boundaries, from boundaries_b64.txt
+#   data/manifest.json      -- {"build_date", "stations": <manifest.json>,
+#                               "geo": <geo_manifest.json>}
+#
+# ---- index.html injection contract (stations exists & is verified; roads
+# and boundaries placeholders do NOT exist in index.html yet -- this is the
+# exact convention the front-end work should match when it adds them) ----
+#   const FUEL_DATA_B64 = "/*FUEL_DATA_PLACEHOLDER*/";               (existing)
+#   const ROADS_DATA_B64 = "/*ROADS_DATA_PLACEHOLDER*/";              (expected)
+#   const BOUNDARIES_DATA_B64 = "/*BOUNDARIES_DATA_PLACEHOLDER*/";    (expected)
+# Same convention as the existing marker: sits inside the string's quotes,
+# CI substitutes only the marker substring with raw base64, adds no quotes.
+# deploy-pages.yml treats each of the three independently -- a payload file
+# that doesn't exist, or a marker index.html doesn't have yet, is a no-op
+# for that one payload only, never a failure.
+
+on:
+  schedule:
+    - cron: "17 9 1 * *" # 09:17 UTC on the 1st of each month
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: "Redo every region even if a checkpoint for it exists in this run's scratch dir"
+        type: boolean
+        default: false
+      regions:
+        description: >-
+          Comma-separated Geofabrik region paths to build (default: full
+          north-america/us,north-america/canada,north-america/mexico). Use
+          per-state/province paths, e.g.
+          north-america/us/california,north-america/us/texas, as a fallback
+          if a full-country download ever proves too large for the runner's
+          disk or RAM.
+        type: string
+        default: ""
+
+permissions:
+  contents: write # force-pushes the single-commit `data` branch (main is never touched)
+  actions: write # to dispatch deploy-pages.yml in the last step
+
+concurrency:
+  group: fuel-data-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # us-latest.osm.pbf is ~11.2GB, canada-latest.osm.pbf ~6.0GB. A
+      # standard ubuntu-latest runner has ~84GB disk but only ~14GB free
+      # by default because of preinstalled toolchains -- reclaim room
+      # before downloading anything multi-GB.
+      - name: Free up runner disk space
+        run: |
+          echo "before:"; df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}" 2>/dev/null || true
+          sudo docker image prune -a -f >/dev/null 2>&1 || true
+          echo "after:"; df -h /
+
+      # Ubuntu's apt osmium-tool is typically a version or two behind the
+      # homebrew build used for local development; `tags-filter` and
+      # `export` have been stable across versions for years, but pin/bump
+      # here if CI ever diverges in observed behavior from local runs.
+      - name: Install osmium-tool
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y osmium-tool
+          osmium --version
+
+      # One download per region: stations, then roads, from the same pbf,
+      # before it's deleted -- then the next region. Keeps peak disk usage
+      # to roughly one region's extract (US, ~11.2GB) at a time.
+      - name: Build stations + roads payloads (per region, one download each)
+        run: |
+          REGIONS="${{ inputs.regions }}"
+          [ -z "$REGIONS" ] && REGIONS="north-america/us,north-america/canada,north-america/mexico"
+          FORCE=""
+          [ "${{ inputs.force_rebuild }}" = "true" ] && FORCE="--force"
+          WORK="${RUNNER_TEMP}/fuel-work"
+          SCRATCH="${RUNNER_TEMP}/scratch"
+          mkdir -p "$WORK" "$SCRATCH"
+          IFS=',' read -ra REGION_LIST <<< "$REGIONS"
+          for region in "${REGION_LIST[@]}"; do
+            echo "=== $region: stations (downloads pbf, keeps it) ==="
+            python3 tools/build_fuel_data.py --regions "$region" --work-dir "$WORK" --out-dir "$SCRATCH" --keep-pbf $FORCE
+            echo "=== $region: roads (reuses that pbf, then deletes it) ==="
+            python3 tools/build_geo_data.py --regions "$region" --work-dir "$WORK" --out-dir "$SCRATCH" --skip-boundaries $FORCE
+          done
+          echo "=== combine all regions: stations (checkpoints already built above, no re-download) ==="
+          python3 tools/build_fuel_data.py --regions "$REGIONS" --work-dir "$WORK" --out-dir build/out
+          echo "=== combine all regions: roads + boundaries (roads checkpoints already built above; boundaries built once here) ==="
+          python3 tools/build_geo_data.py --regions "$REGIONS" --work-dir "$WORK" --out-dir build/out
+
+      - name: Show manifests
+        run: |
+          echo "--- stations ---"; cat build/out/manifest.json
+          echo "--- geo ---"; cat build/out/geo_manifest.json
+
+      - name: Merge manifests
+        run: |
+          python3 - <<'PY'
+          import json, datetime, pathlib
+          stations = json.load(open("build/out/manifest.json"))
+          geo = json.load(open("build/out/geo_manifest.json"))
+          combined = {
+              "build_date": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              "stations": stations,
+              "geo": geo,
+          }
+          pathlib.Path("build/out/combined_manifest.json").write_text(json.dumps(combined, indent=2))
+          PY
+
+      # Skip the force-push entirely if nothing changed -- a rebuild against
+      # unchanged upstream OSM/Natural Earth data (or a re-run) shouldn't
+      # rewrite `data` or trigger a pointless redeploy. Compares only the
+      # three payload files, not manifest.json (whose build_date always
+      # differs).
+      - name: Check whether payload changed
+        id: compare
+        run: |
+          changed=true
+          if git ls-remote --exit-code --heads origin data >/dev/null 2>&1; then
+            git fetch --depth 1 origin data
+            changed=false
+            declare -A SRC=( [fuel-na.b64]=build/out/payload_b64.txt [roads-na.b64]=build/out/roads_b64.txt [boundaries-na.b64]=build/out/boundaries_b64.txt )
+            for name in "${!SRC[@]}"; do
+              src="${SRC[$name]}"
+              if git cat-file -e "FETCH_HEAD:data/$name" 2>/dev/null; then
+                git cat-file -p "FETCH_HEAD:data/$name" > "/tmp/existing-$name"
+                cmp -s "$src" "/tmp/existing-$name" || changed=true
+              else
+                changed=true
+              fi
+            done
+          fi
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          echo "payload changed: $changed"
+
+      # A worktree of this same checkout shares its origin remote and
+      # already-authenticated credentials (from actions/checkout above), so
+      # no separate token wiring is needed to push it. --orphan gives a
+      # worktree with no files and no parent commit -- exactly one commit
+      # goes in, then --force overwrites whatever was on `data` before.
+      - name: Force-push all three payloads as a single commit on the data branch
+        if: steps.compare.outputs.changed == 'true'
+        run: |
+          rm -rf /tmp/data-wt
+          git worktree add --orphan -b data /tmp/data-wt
+          mkdir -p /tmp/data-wt/data
+          cp build/out/payload_b64.txt /tmp/data-wt/data/fuel-na.b64
+          cp build/out/roads_b64.txt /tmp/data-wt/data/roads-na.b64
+          cp build/out/boundaries_b64.txt /tmp/data-wt/data/boundaries-na.b64
+          cp build/out/combined_manifest.json /tmp/data-wt/data/manifest.json
+          cd /tmp/data-wt
+          git add data/fuel-na.b64 data/roads-na.b64 data/boundaries-na.b64 data/manifest.json
+          git -c user.name="github-actions[bot]" \
+              -c user.email="github-actions[bot]@users.noreply.github.com" \
+              commit -q -m "Fuel/roads/boundaries data payload ($(date -u +%Y-%m-%d))"
+          git push --force origin HEAD:refs/heads/data
+
+      - name: Trigger deploy with the new payload
+        if: steps.compare.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run deploy-pages.yml --ref main

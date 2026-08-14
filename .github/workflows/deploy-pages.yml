@@ -1,0 +1,125 @@
+name: Deploy Pages
+
+# Publishes index.html to GitHub Pages. Runs on every push to main, on
+# manual dispatch, and is explicitly dispatched by refresh-fuel-data.yml
+# after it force-pushes a new payload commit to the orphan `data` branch
+# (see that workflow for why: main never contains the payload, and a
+# GITHUB_TOKEN push doesn't trigger this workflow's own push event, so
+# refresh dispatches it directly). No download, no osmium, no cache --
+# this only shallow-fetches `data`, injects what it finds, and publishes.
+# Should complete in well under a minute.
+#
+# Requires repo Settings -> Pages -> Source = "GitHub Actions" (unaffected
+# by this workflow -- must be switched manually by the repo owner once).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stage site
+        run: |
+          mkdir -p _site
+          cp index.html _site/index.html
+
+      # Shallow-fetch just the `data` branch's tip -- fetch-depth 1, no
+      # history, nothing else from the repo. The branch doesn't exist until
+      # the first refresh-fuel-data.yml run ever completes; that's the
+      # current state of this repo, so this must degrade cleanly, not fail.
+      - name: Fetch payload from the data branch (if it exists)
+        run: |
+          mkdir -p data
+          if git ls-remote --exit-code --heads origin data >/dev/null 2>&1; then
+            git fetch --depth 1 origin data
+            for name in fuel-na.b64 roads-na.b64 boundaries-na.b64 manifest.json; do
+              git cat-file -e "FETCH_HEAD:data/$name" 2>/dev/null && \
+                git cat-file -p "FETCH_HEAD:data/$name" > "data/$name" || true
+            done
+            echo "fetched from data branch: $(ls data/)"
+          else
+            echo "no data branch yet -- shipping without any embedded payload"
+          fi
+
+      # ---- Injection contract ----
+      # index.html (owned by the front-end agent) contains:
+      #   const FUEL_DATA_B64 = "/*FUEL_DATA_PLACEHOLDER*/";
+      # i.e. the marker sits *inside* the existing string quotes (confirmed
+      # by reading index.html directly -- see also its own self-test at
+      # decodeFuelData(FUEL_DATA_B64) === null for the un-injected value).
+      # Roads/boundaries use the same convention with their own markers,
+      # ROADS_DATA_PLACEHOLDER / BOUNDARIES_DATA_PLACEHOLDER, once the
+      # front-end adds them (see refresh-fuel-data.yml's header comment for
+      # the exact expected tokens) -- they don't exist in index.html yet.
+      # Each of the three below is fully independent: no payload file, or
+      # no matching marker in index.html, is a silent no-op for that one
+      # substitution only, never a failure. The station marker is the one
+      # established, verified contract, so *that* one alone still errors
+      # loudly if its marker is missing (a real contract break, not an
+      # expected transitional state).
+      - name: Inject payloads into index.html placeholders
+        run: |
+          python3 - <<'PY'
+          import pathlib
+
+          html_path = pathlib.Path("_site/index.html")
+          html = html_path.read_text()
+
+          # (payload filename, marker, label, strict). strict=True fails the
+          # build if the marker is missing (an established, verified
+          # contract); strict=False just skips that one injection (the
+          # front end hasn't added this marker to index.html yet).
+          targets = [
+              ("fuel-na.b64", "/*FUEL_DATA_PLACEHOLDER*/", "stations", True),
+              ("roads-na.b64", "/*ROADS_DATA_PLACEHOLDER*/", "roads", False),
+              ("boundaries-na.b64", "/*BOUNDARIES_DATA_PLACEHOLDER*/", "boundaries", False),
+          ]
+
+          for payload_file, marker, label, strict in targets:
+              p = pathlib.Path("data") / payload_file
+              if not p.exists():
+                  print(f"{label}: no {p} -- skipping (no-op)")
+                  continue
+              if marker not in html:
+                  msg = f"{label}: marker {marker!r} not found in index.html"
+                  if strict:
+                      raise SystemExit(f"::error::{msg} -- established contract broken")
+                  print(f"{label}: {msg} -- skipping (front end hasn't added this placeholder yet)")
+                  continue
+              b64 = p.read_text().strip()
+              html = html.replace(marker, b64, 1)
+              print(f"{label}: injected {len(b64)} bytes")
+
+          html_path.write_text(html)
+          PY
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

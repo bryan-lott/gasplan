@@ -5,8 +5,22 @@
 node_modules/
 __pycache__/
 
-# tools/build_fuel_data.py output -- OSM downloads, checkpoints, and the
-# base64 payload. Never committed; the GitHub Actions workflow builds this
-# in-runner and carries it only in the Pages deploy artifact / cache.
+# tools/build_fuel_data.py / tools/build_geo_data.py scratch output
+# (downloads, checkpoints, staged build/out/ payload files). Never
+# committed on main -- the payload lives only on the orphan `data` branch
+# (see refresh-fuel-data.yml + README.md's "Embedded Offline Data" section).
 build/
 _site/
+
+# The fetched/staged payload (README.md's `git fetch origin data:data` +
+# `git show` recipe writes here for local dev, and deploy-pages.yml stages
+# a fetch here in CI). This directory belongs on the `data` branch only --
+# ignored on every other branch so a stray `git add -A` on main can't
+# accidentally commit it there.
+data/
+
+# Never commit a raw Geofabrik extract -- multi-GB, and GitHub hard-blocks
+# anything over 100MB anyway. Belt-and-suspenders in case --work-dir or
+# --out-dir is ever pointed somewhere other than build/ during a local run.
+*.osm.pbf
+*.pbf
