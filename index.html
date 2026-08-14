@@ -832,7 +832,7 @@ svg.leaflet-image-layer.leaflet-interactive path {
   </div>
   <div id="exportOut" class="meta"></div>
   <div class="meta" style="margin-top:16px;padding-top:10px;border-top:1px solid var(--line)">
-    Fuel stations © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap contributors</a>,
+    Fuel stations and roads © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap contributors</a>,
     used under the <a href="https://opendatacommons.org/licenses/odbl/" target="_blank" rel="noopener">Open Database License (ODbL)</a>.
   </div>
 </div>
@@ -2113,6 +2113,118 @@ function ensureFuelDataDecode(b64 = FUEL_DATA_B64) {
 if ('requestIdleCallback' in window) requestIdleCallback(() => ensureFuelDataDecode(), { timeout: 2000 });
 else setTimeout(() => ensureFuelDataDecode(), 200);
 
+// --- roads + boundaries: offline map-orientation layers, built by tools/build_geo_data.py (not
+// this file — see its own header for the pipeline). Wire format for roads matches encode_chains()
+// there exactly: uvarint chain count, a ref dictionary table, an always-empty name table (names
+// dropped by design, still present in the stream), then per chain a point count, a motorway/trunk
+// byte, a ref index, a name index (always 0), and zigzag-delta-coded (lon*1e5, lat*1e5) points —
+// delta state carried ACROSS chains, same locality trick as the fuel dataset above. Boundaries are
+// gzip'd quantized TopoJSON (topojson-server output); decodeTopology below is a hand-rolled arc
+// decoder (ponytail: no topojson-client dep for the handful of geometry types Natural Earth uses).
+// Both reuse readFuelUvarint/zigzagDecode/readFuelStr/base64ToBytes above — wire-format-agnostic
+// despite the "Fuel" name, so a second copy of the same varint/string readers would just be
+// duplication.
+const ROADS_DATA_B64 = "/*ROADS_DATA_PLACEHOLDER*/";
+const BOUNDARIES_DATA_B64 = "/*BOUNDARIES_DATA_PLACEHOLDER*/";
+
+async function gunzipB64(b64) {
+  const stream = new Blob([base64ToBytes(b64)]).stream().pipeThrough(new DecompressionStream('gzip'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+// One chain per contiguous road segment: { motorway: bool, ref: string|null, latlngs: [[lat,lon],...] }.
+function decodeRoadChains(bytes) {
+  const pos = { i: 0 };
+  const n = readFuelUvarint(bytes, pos);
+  const nRefs = readFuelUvarint(bytes, pos);
+  const refs = Array.from({ length: nRefs }, () => readFuelStr(bytes, pos));
+  const nNames = readFuelUvarint(bytes, pos); // always 0 (names dropped) — still consumed to keep the cursor aligned
+  for (let k = 0; k < nNames; k++) readFuelStr(bytes, pos);
+  const chains = new Array(n);
+  let prevLon = 0, prevLat = 0;
+  for (let w = 0; w < n; w++) {
+    const npts = readFuelUvarint(bytes, pos);
+    const isMotorway = bytes[pos.i++];
+    const refIdx = readFuelUvarint(bytes, pos);
+    readFuelUvarint(bytes, pos); // name index — always 0, no name table to look up
+    const latlngs = new Array(npts);
+    for (let p = 0; p < npts; p++) {
+      prevLon += zigzagDecode(readFuelUvarint(bytes, pos));
+      prevLat += zigzagDecode(readFuelUvarint(bytes, pos));
+      latlngs[p] = [prevLat / 1e5, prevLon / 1e5]; // Leaflet wants [lat, lon]
+    }
+    chains[w] = { motorway: !!isMotorway, ref: refIdx ? refs[refIdx - 1] : null, latlngs };
+  }
+  return chains;
+}
+
+// Quantized-TopoJSON arc decoder — dequantizes + delta-decodes each arc once, then resolves each
+// geometry's arc-index references into plain [lat,lon] point chains. Rings/lines both come out as
+// plain point chains (not closed/filled polygons): this app only ever draws them as thin outlines,
+// so a ring and a line render identically and don't need a GeoJSON Polygon/LineString distinction
+// past this point — ponytail: no topojson-client, no intermediate GeoJSON, just what L.polyline needs.
+function decodeTopology(topo) {
+  const t = topo.transform;
+  const arcs = topo.arcs.map(arc => {
+    let x = 0, y = 0;
+    return arc.map(([dx, dy]) => {
+      x += dx; y += dy;
+      return t ? [x * t.scale[0] + t.translate[0], y * t.scale[1] + t.translate[1]] : [x, y]; // [lon, lat]
+    });
+  });
+  function resolve(idxs) {
+    let pts = [];
+    for (const idx of idxs) {
+      const rev = idx < 0;
+      let seg = arcs[rev ? ~idx : idx];
+      if (rev) seg = seg.slice().reverse();
+      if (pts.length) pts.pop(); // shared endpoint between consecutive arcs
+      pts = pts.concat(seg);
+    }
+    return pts.map(([lon, lat]) => [lat, lon]); // Leaflet order
+  }
+  function lines(g) {
+    if (g.type === 'Polygon') return g.arcs.map(resolve);
+    if (g.type === 'MultiPolygon') return g.arcs.flatMap(poly => poly.map(resolve));
+    if (g.type === 'LineString') return [resolve(g.arcs)];
+    if (g.type === 'MultiLineString') return g.arcs.map(resolve);
+    return [];
+  }
+  const out = {};
+  for (const key in topo.objects) out[key] = topo.objects[key].geometries.flatMap(lines);
+  return out;
+}
+
+// Same never-throws / degrade-to-null contract as decodeFuelData: an un-injected placeholder, a
+// genuinely empty payload, or no DecompressionStream all mean "no orientation layer", not an error.
+async function decodeRoadsData(b64) {
+  if (!b64 || !/^[A-Za-z0-9+/=]+$/.test(b64) || typeof DecompressionStream === 'undefined') return null;
+  try { return decodeRoadChains(await gunzipB64(b64)); }
+  catch (err) { console.error('embedded roads dataset failed to decode:', err); return null; }
+}
+async function decodeBoundariesData(b64) {
+  if (!b64 || !/^[A-Za-z0-9+/=]+$/.test(b64) || typeof DecompressionStream === 'undefined') return null;
+  try { return decodeTopology(JSON.parse(new TextDecoder().decode(await gunzipB64(b64)))); }
+  catch (err) { console.error('embedded boundaries dataset failed to decode:', err); return null; }
+}
+
+// Memoized the same way as fuelDataPromise/ensureFuelDataDecode — each decode runs at most once,
+// and renderGeoLayers (defined below, near initMap) re-paints once whichever of these resolves.
+let roadsData = null, roadsDataPromise = null;
+function ensureRoadsDataDecode(b64 = ROADS_DATA_B64) {
+  if (!roadsDataPromise) roadsDataPromise = decodeRoadsData(b64).then(d => { roadsData = d; renderGeoLayers(); return d; });
+  return roadsDataPromise;
+}
+let boundariesData = null, boundariesDataPromise = null;
+function ensureBoundariesDataDecode(b64 = BOUNDARIES_DATA_B64) {
+  if (!boundariesDataPromise) boundariesDataPromise = decodeBoundariesData(b64).then(d => { boundariesData = d; renderGeoLayers(); return d; });
+  return boundariesDataPromise;
+}
+// Same after-first-paint timing as the fuel dataset — measured ~4ms (roads) / ~7ms (boundaries) at
+// full size, nowhere near enough to justify their own idle-callback slot.
+if ('requestIdleCallback' in window) requestIdleCallback(() => { ensureRoadsDataDecode(); ensureBoundariesDataDecode(); }, { timeout: 2000 });
+else setTimeout(() => { ensureRoadsDataDecode(); ensureBoundariesDataDecode(); }, 200);
+
 // Primary station source — replaces fetchStations/overpassFuel for a normal plan (see the brief).
 // Synchronous once fuelData is ready, with zero involvement from lookupClockStart/the progress bar
 // (Finding 6): an embedded lookup is instant and running that machinery for it would just flash.
@@ -2492,6 +2604,36 @@ function initMap() {
   }
 }
 let { map, drawn } = initMap();
+
+// --- roads + boundaries rendering (see decodeRoadsData/decodeTopology above) ---------------------
+// Drawn into their own pane, below the default overlayPane (zIndex 400) the route polyline and
+// stop markers use, so they stay visually subordinate no matter which finishes decoding/rendering
+// first — a pane's fixed z-index is simpler than fighting Leaflet's DOM-order-based stacking
+// against two independent async decodes. Shown only while navigator.onLine is false: the same
+// best-effort "there's probably no basemap" signal updateOfflineNote already relies on below — with
+// tiles actually loaded, subdued state/country outlines and road lines would just be clutter over
+// the real map (see the brief's screenshots for the call this is based on).
+let geoLayerGroup = null;
+function renderGeoLayers() {
+  if (!map) return;
+  if (geoLayerGroup) { geoLayerGroup.remove(); geoLayerGroup = null; }
+  if (navigator.onLine) return; // tiles are presumably up — see comment above
+  if (!map.getPane('geoPane')) { map.createPane('geoPane'); map.getPane('geoPane').style.zIndex = 350; }
+  const group = L.layerGroup();
+  const boundaryStyle = { pane: 'geoPane', color: '#94a3b8', weight: 1, opacity: 0.6, interactive: false };
+  for (const key of ['countries', 'states', 'coastline']) {
+    for (const line of (boundariesData ? boundariesData[key] || [] : [])) L.polyline(line, boundaryStyle).addTo(group);
+  }
+  // ponytail: no ref labels (I-80, US-50, ...) — chains carry `ref`, but placing text legibly
+  // along ~7800 polylines is fiddly for what's meant to be quiet background context, not the
+  // subject; a hover tooltip per chain would be a one-line add if that's ever asked for.
+  for (const c of (roadsData || [])) {
+    L.polyline(c.latlngs, { pane: 'geoPane', color: '#b08968', weight: c.motorway ? 1.3 : 1, opacity: 0.55, interactive: false }).addTo(group);
+  }
+  group.addTo(map);
+  geoLayerGroup = group;
+}
+
 let routeLineLayer = null; // the plain polyline drawn before economy is known; swapped for
                             // per-segment colour once planEconomy resolves — see drawEconLine.
 
@@ -2505,6 +2647,8 @@ function updateOfflineNote() { $('offlineNote').style.display = navigator.onLine
 window.addEventListener('online', updateOfflineNote);
 window.addEventListener('offline', updateOfflineNote);
 updateOfflineNote();
+window.addEventListener('online', renderGeoLayers);
+window.addEventListener('offline', renderGeoLayers);
 
 // Live "still working" readout for a station lookup, independent of say()'s text. postOverpass's
 // own retry loop only calls say() when it CATCHES a timeout/504 — while a request is genuinely in
@@ -4652,7 +4796,78 @@ if (new URLSearchParams(location.search).get('test')) {
     }
   })();
 
-  Promise.all([mapConcurrentCheck, staleRunChecks, lookupGatingChecks, lookupSharedClosureChecks, fuelDataChecks]).then(() => {
+  // Roads/boundaries orientation layers: decode round-trip through the roads varint scheme and the
+  // hand-rolled TopoJSON arc decoder, plus the same missing-payload no-op contract as the fuel
+  // dataset above.
+  const geoDataChecks = (async () => {
+    if (typeof CompressionStream !== 'undefined') {
+      // --- roads: same wire format as roads_common.encode_chains()/build_geo_data.py — two
+      // synthetic chains sharing one ref dictionary entry, delta state carried across chains.
+      const buf = [];
+      const wUv = n => { while (true) { const b = n & 0x7f; n = Math.floor(n / 128); if (n) buf.push(b | 0x80); else { buf.push(b); break; } } };
+      const wZig = n => wUv(n < 0 ? -n * 2 - 1 : n * 2);
+      const wStr = s => { const b = new TextEncoder().encode(s || ''); wUv(b.length); b.forEach(x => buf.push(x)); };
+      wUv(2); // n chains
+      wUv(1); wStr('I-70'); // 1 ref
+      wUv(0); // n names — always 0, no name table
+      // chain 1: motorway, ref I-70, 2 points: (-105.0, 39.7) then (-104.95, 39.6)
+      wUv(2); buf.push(1); wUv(1); wUv(0);
+      wZig(-10500000); wZig(3970000); wZig(5000); wZig(-10000);
+      // chain 2: trunk, no ref, 1 point, continuing the running delta from chain 1
+      wUv(1); buf.push(0); wUv(0); wUv(0);
+      wZig(200000); wZig(300000);
+      const rawBytes = new Uint8Array(buf);
+      const gzStream = new Blob([rawBytes]).stream().pipeThrough(new CompressionStream('gzip'));
+      const gzBytes = new Uint8Array(await new Response(gzStream).arrayBuffer());
+      let bin = ''; gzBytes.forEach(b => bin += String.fromCharCode(b));
+      const roadsTestB64 = btoa(bin);
+
+      const decodedRoads = await decodeRoadsData(roadsTestB64);
+      ok(decodedRoads && decodedRoads.length === 2, `synthetic roads payload round-tripped through decodeRoadsData: ${decodedRoads && decodedRoads.length} chains`);
+      ok(decodedRoads && decodedRoads[0].motorway === true && decodedRoads[0].ref === 'I-70', 'chain 1 motorway flag + ref survived the round trip');
+      ok(decodedRoads && decodedRoads[1].motorway === false && decodedRoads[1].ref === null, 'chain 2 trunk flag + absent ref survived the round trip');
+      ok(decodedRoads && Math.abs(decodedRoads[0].latlngs[0][0] - 39.7) < 1e-4 && Math.abs(decodedRoads[0].latlngs[0][1] - (-105.0)) < 1e-4,
+        `chain 1 point 1 decoded to [lat,lon]: ${decodedRoads && decodedRoads[0].latlngs[0]}`);
+      ok(decodedRoads && Math.abs(decodedRoads[0].latlngs[1][0] - 39.6) < 1e-4 && Math.abs(decodedRoads[0].latlngs[1][1] - (-104.95)) < 1e-4,
+        `chain 1 point 2's delta-coded coordinate decoded correctly: ${decodedRoads && decodedRoads[0].latlngs[1]}`);
+
+      // --- boundaries: the hand-rolled TopoJSON arc decoder — one quantized arc, a Polygon and a
+      // reversed-index LineString both referencing it, to exercise the negative-index path too.
+      const topo = {
+        type: 'Topology',
+        transform: { scale: [0.001, 0.001], translate: [-106, 39] },
+        arcs: [[[0, 0], [100, 100], [100, 0]]], // dequantizes to (-106,39), (-105.9,39.1), (-105.8,39.1)
+        objects: {
+          states: { type: 'GeometryCollection', geometries: [{ type: 'Polygon', arcs: [[0]] }] },
+          coastline: { type: 'GeometryCollection', geometries: [{ type: 'LineString', arcs: [~0] }] },
+        },
+      };
+      const decodedTopo = decodeTopology(topo);
+      ok(Array.isArray(decodedTopo.states) && decodedTopo.states.length === 1 && decodedTopo.states[0].length === 3,
+        `Polygon geometry resolves to one 3-point ring: ${decodedTopo.states && decodedTopo.states[0] && decodedTopo.states[0].length}`);
+      ok(Math.abs(decodedTopo.states[0][0][0] - 39) < 1e-6 && Math.abs(decodedTopo.states[0][0][1] - (-106)) < 1e-6,
+        `arc dequantizes + delta-decodes to the transform's origin point: ${decodedTopo.states[0][0]}`);
+      ok(decodedTopo.coastline[0].length === 3 && Math.abs(decodedTopo.coastline[0][0][0] - decodedTopo.states[0][2][0]) < 1e-6,
+        'a negative (reversed) arc index resolves to the same points in reverse order');
+    }
+
+    // Missing/un-injected placeholders must decode to null, never throw — checked either way so
+    // this also passes once CI has actually injected real payloads (same pattern as FUEL_DATA_B64).
+    const ownRoads = await decodeRoadsData(ROADS_DATA_B64);
+    if (ROADS_DATA_B64.includes('ROADS_DATA_PLACEHOLDER')) {
+      ok(ownRoads === null, 'the committed roads placeholder decodes to null, not an error');
+    } else {
+      ok(ownRoads && ownRoads.length > 0, `an injected real ROADS_DATA_B64 decodes to a non-empty chain set: ${ownRoads && ownRoads.length}`);
+    }
+    const ownBoundaries = await decodeBoundariesData(BOUNDARIES_DATA_B64);
+    if (BOUNDARIES_DATA_B64.includes('BOUNDARIES_DATA_PLACEHOLDER')) {
+      ok(ownBoundaries === null, 'the committed boundaries placeholder decodes to null, not an error');
+    } else {
+      ok(ownBoundaries && Object.keys(ownBoundaries).length > 0, `an injected real BOUNDARIES_DATA_B64 decodes to non-empty layers: ${ownBoundaries && Object.keys(ownBoundaries)}`);
+    }
+  })();
+
+  Promise.all([mapConcurrentCheck, staleRunChecks, lookupGatingChecks, lookupSharedClosureChecks, fuelDataChecks, geoDataChecks]).then(() => {
     console.log('%call self checks passed', 'color:green;font-weight:bold');
     say('Self checks passed — see console.');
   }).catch(err => {
