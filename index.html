@@ -737,6 +737,15 @@ svg.leaflet-image-layer.leaflet-interactive path {
   .wp-row input { flex:1; }
   .wp-row button { flex:none; width:30px; margin:0; padding:0; font-weight:400; }
   #addWp { background:transparent; color:var(--accent); border:1px dashed var(--line); font-weight:400; }
+  /* Waypoint suggestion listbox: a single body-level element (see suggestBox in the JS),
+     position:fixed and repositioned under whichever .wp input is focused, so it has to escape
+     #panel's overflow-y:auto clipping. z-index above every z-index already in this file — the
+     highest is 1000, on Leaflet's .leaflet-top/.leaflet-bottom controls and #mobileActions. */
+  .wp-suggest { position:fixed; z-index:2000; max-height:220px; overflow-y:auto;
+                background:var(--bg); border:1px solid var(--line); border-radius:5px;
+                box-shadow:0 4px 14px rgba(0,0,0,.25); }
+  .wp-suggest-opt { padding:6px 9px; font-size:14px; cursor:pointer; }
+  .wp-suggest-opt:hover, .wp-suggest-opt.active { background:var(--accent); color:#fff; }
   .opt { border:1px solid var(--line); border-radius:5px; padding:8px 10px; margin-top:8px; cursor:pointer; }
   .opt:hover { border-color:var(--accent); }
   .opt.sel { border-color:var(--accent); background:rgba(194,65,12,.08); }
@@ -1490,20 +1499,81 @@ async function getJSON(url, opts = {}) {
   return res.json();
 }
 
-// Nominatim's usage policy caps the whole app at 1 request/second, summed across every user, and
-// requires results to be cached on our side — this isn't just an optimization, it's the terms of
-// using the free endpoint at all. Keyed on the normalized (trimmed, lowercased) query text, the
-// same "same real input -> same cache entry" shape elevCache already gives coordinates.
+// Keyed on the normalized (trimmed, lowercased) query text, the same "same real input -> same
+// cache entry" shape elevCache already gives coordinates. Photon's public instance sets no
+// documented rate limit, but a waypoint the user retypes identically shouldn't cost a request.
 function geocodeCacheKey(query) { return query.trim().toLowerCase(); }
+
+// Waypoint text is typed by a human, so it arrives misspelled ("cheyene, WY"), uncommaed
+// ("denver co"), or both, and a geocoder that answers literally will happily resolve the typo to
+// something real but wrong. "cheyene, WY" matches a residential street actually spelled "Cheyene
+// Avenue" in Wyandotte County, KANSAS — "WY" matching *Wyandotte* — which silently sent a
+// Denver->Cheyenne trip 600 miles east. Typo tolerance alone doesn't fix it: an exact match on an
+// incidental POI still outranks a fuzzy match on the city meant, so Photon returns that same
+// Kansas street for the same query.
+//
+// What separates every wrong answer from every right one is the kind of thing matched, not how
+// well it matched — the bad hits are streets, churches, and apartment blocks, never populated
+// places. So ask Photon for settlements first (layer= restricts to populated places and admin
+// areas) and accept the hit only if it really is one. A query that legitimately isn't a town
+// ("Yellowstone National Park", a street address) finds nothing usable under that filter and
+// falls back to an unrestricted search, which is what the old code did for everything.
+const PLACE_LAYERS = ['city', 'locality', 'county', 'state'];
+
+// The layer filter narrows what's searched but doesn't guarantee what comes back: a landuse
+// polygon named like a town still slips through as a "locality", so the class is checked here.
+function isPlace(feature) {
+  const key = feature && feature.properties && feature.properties.osm_key;
+  return key === 'place' || key === 'boundary';
+}
+
+// Photon returns address parts as separate fields where Nominatim returned one display_name
+// string, so rebuild that "Name, County, State, Country" shape — callers show label.split(',')[0]
+// as the waypoint's short name. Deduped because a city's name and its `city` field are the same
+// string, which would otherwise render "Denver, Denver, Colorado, United States".
+function photonLabel(props) {
+  return [...new Set([props.name, props.city, props.county, props.state, props.country]
+    .filter(Boolean))].join(', ');
+}
+
+// limit/opts are additive — every existing call site (geocode below) omits both and keeps
+// getting exactly one hit with no fetch options, unchanged.
+async function photonSearch(query, layers, limit = 1, opts = {}) {
+  const j = await getJSON('https://photon.komoot.io/api?limit=' + limit + '&q=' + encodeURIComponent(query) +
+                          layers.map(l => '&layer=' + l).join(''), opts);
+  return j.features || [];
+}
+
 async function geocode(query) {
   const cacheKey = geocodeCacheKey(query);
   if (geocodeCache.has(cacheKey)) return geocodeCache.get(cacheKey);
-  const j = await getJSON('https://nominatim.openstreetmap.org/search?format=json&limit=1&q=' +
-                          encodeURIComponent(query));
-  if (!j.length) throw new Error(`Could not find "${query}"`);
-  const result = { lat: +j[0].lat, lon: +j[0].lon, label: j[0].display_name };
+  let hits = await photonSearch(query, PLACE_LAYERS);
+  if (!hits.length || !isPlace(hits[0])) hits = await photonSearch(query, []);
+  if (!hits.length) throw new Error(`Could not find "${query}"`);
+  const [lon, lat] = hits[0].geometry.coordinates;
+  const result = { lat, lon, label: photonLabel(hits[0].properties) };
   geocodeCache.set(cacheKey, result);
   return result;
+}
+
+// Suggestion-dropdown seam, kept pure (no DOM, no network) so the self-check suite can hit it
+// directly. Mirrors photonLabel's dedup, just across a whole features array instead of one
+// feature: drops anything that produces an empty label (a hit missing every name-ish field) and
+// collapses repeats, so the same settlement returned twice never shows as two identical rows.
+// Never throws on a malformed feature/features array — a suggest request's response shape isn't
+// worth trusting any more than geocode()'s is.
+function suggestionLabels(features, max) {
+  if (!Array.isArray(features)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const f of features) {
+    if (out.length >= max) break;
+    const label = f && f.properties && photonLabel(f.properties);
+    if (!label || seen.has(label)) continue;
+    seen.add(label);
+    out.push(label);
+  }
+  return out;
 }
 
 // coords: [{lat,lon}, ...], 2+ waypoints, OSRM takes them straight through in order.
@@ -2782,7 +2852,8 @@ function renderWaypoints() {
     return `
     <div class="wp-block">
       <div class="wp-row">
-        <input class="wp" data-i="${i}" value="${w.text.replace(/"/g, '&quot;')}">
+        <input class="wp" data-i="${i}" value="${w.text.replace(/"/g, '&quot;')}"
+          role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="wpSuggest" autocomplete="off">
         ${btns}
       </div>
       ${refuelRow}
@@ -2810,6 +2881,129 @@ function clearPlanResults() {
   drawn.clearLayers(); // bug fix: a reorder/insert left the stale route polyline drawn with every panel empty
 }
 
+// --- waypoint suggestions ----------------------------------------------------------------
+// Typo-tolerant autocomplete, defence-in-depth on top of geocode()'s own settlement-layer
+// filter: the fix stops a typo from silently *resolving* to the wrong place, this lets the user
+// *see* the right spelling before they ever hit plan. Deliberately not a <datalist> — a browser
+// filters datalist options by substring of what's typed, so "cheyene" would hide the "Cheyenne,
+// ..." option, which is the one case this exists to catch.
+//
+// Single shared container appended to document.body, not one per waypoint row: renderWaypoints()
+// rebuilds #waypoints' innerHTML wholesale on every add/remove/reorder, which would tear out any
+// element nested inside a row. Living at the body level and repositioned under whichever input
+// is focused sidesteps that entirely.
+const suggestBox = document.createElement('div');
+suggestBox.id = 'wpSuggest';
+suggestBox.className = 'wp-suggest';
+suggestBox.setAttribute('role', 'listbox');
+suggestBox.style.display = 'none';
+document.body.appendChild(suggestBox);
+
+let suggestInput = null;    // the .wp <input> currently showing suggestions, or null
+let suggestItems = [];      // current label strings, index-aligned with suggestBox's children
+let suggestActive = -1;     // highlighted option index, -1 = none
+let suggestAbort = null;    // in-flight fetch's AbortController, aborted on the next keystroke
+let suggestDebounce = null;
+
+function hideSuggest() {
+  suggestBox.style.display = 'none';
+  suggestBox.innerHTML = '';
+  suggestItems = [];
+  suggestActive = -1;
+  if (suggestInput) suggestInput.setAttribute('aria-expanded', 'false');
+  suggestInput = null;
+  if (suggestAbort) { suggestAbort.abort(); suggestAbort = null; }
+}
+
+function setSuggestActive(i) {
+  suggestActive = i;
+  [...suggestBox.children].forEach((opt, idx) => {
+    opt.setAttribute('aria-selected', idx === i ? 'true' : 'false');
+    opt.classList.toggle('active', idx === i);
+  });
+  if (suggestInput) suggestInput.setAttribute('aria-activedescendant', i >= 0 ? `wpSuggestOpt${i}` : '');
+}
+
+function pickSuggestion(i) {
+  const input = suggestInput, label = suggestItems[i];
+  if (!input || label == null) return;
+  const idx = +input.dataset.i;
+  input.value = label;
+  waypoints[idx].text = label;
+  saveWaypoints();
+  invalidateRoutes();
+  hideSuggest();
+  input.focus();
+}
+
+function renderSuggest(input, labels) {
+  suggestInput = input;
+  suggestItems = labels;
+  suggestActive = -1;
+  const r = input.getBoundingClientRect();
+  suggestBox.style.left = r.left + 'px';
+  suggestBox.style.top = r.bottom + 'px';
+  suggestBox.style.width = r.width + 'px';
+  suggestBox.innerHTML = '';
+  labels.forEach((label, i) => {
+    const opt = document.createElement('div');
+    opt.className = 'wp-suggest-opt';
+    opt.id = `wpSuggestOpt${i}`;
+    opt.setAttribute('role', 'option');
+    opt.setAttribute('aria-selected', 'false');
+    opt.textContent = label; // textContent, not innerHTML — a Photon label is untrusted text
+    // mousedown, not click: blur fires (and would hide the list) before a click ever lands.
+    // preventDefault on the mousedown stops that blur from firing at all, so the input never
+    // loses focus in the first place — pickSuggestion's own input.focus() is just a backstop.
+    opt.addEventListener('mousedown', e => { e.preventDefault(); pickSuggestion(i); });
+    suggestBox.appendChild(opt);
+  });
+  suggestBox.style.display = 'block';
+  input.setAttribute('aria-expanded', 'true');
+}
+
+// Mirrors geocode(): settlement-layer hits first, and only if none survive isPlace() does the
+// query fall back to an unrestricted search. Suggesting anything geocode() itself would reject
+// would offer options that don't match what pressing enter actually resolves to.
+async function fetchSuggestions(query, signal) {
+  let hits = (await photonSearch(query, PLACE_LAYERS, 5, { signal })).filter(isPlace);
+  let labels = suggestionLabels(hits, 5);
+  if (labels.length) return labels;
+  hits = await photonSearch(query, [], 5, { signal });
+  return suggestionLabels(hits, 5);
+}
+
+// getJSON builds its fetch options as `{ signal: AbortSignal.timeout(...), ...opts }` — opts is
+// spread in *after* the timeout signal, so an opts.signal we pass through overwrites it rather
+// than being overwritten by it. Our AbortController's signal reaches fetch() untouched; the only
+// cost is losing getJSON's 45s timeout guard for this one request, which doesn't matter here —
+// a stale request is aborted by the next keystroke, and one nobody's waiting on (user stopped
+// typing) simply never gets rendered. So this routes through photonSearch/getJSON as-is instead
+// of duplicating Photon's URL-building in a bare fetch() call.
+async function runSuggest(input, query) {
+  const controller = new AbortController();
+  suggestAbort = controller;
+  let labels = [];
+  try {
+    labels = await fetchSuggestions(query, controller.signal);
+  } catch {
+    // Aborted by a newer keystroke, or a genuine network failure — either way, suggestions are
+    // a convenience: never surface an error to the user or block typing.
+  }
+  if (suggestAbort !== controller) return; // superseded by a request that started after this one
+  suggestAbort = null;
+  if (!labels.length) { hideSuggest(); return; }
+  renderSuggest(input, labels);
+}
+
+function suggestOnInput(input) {
+  clearTimeout(suggestDebounce);
+  if (suggestAbort) { suggestAbort.abort(); suggestAbort = null; }
+  const query = input.value.trim();
+  if (query.length < 3) { hideSuggest(); return; }
+  suggestDebounce = setTimeout(() => runSuggest(input, query), 250);
+}
+
 $('waypoints').addEventListener('input', e => {
   const i = +e.target.dataset.i;
   if (e.target.classList.contains('wp')) waypoints[i].text = e.target.value;
@@ -2817,7 +3011,36 @@ $('waypoints').addEventListener('input', e => {
   else return;
   saveWaypoints();
   invalidateRoutes(); // waypoint text/radius no longer matches whatever step 1 last found
+  if (e.target.classList.contains('wp')) suggestOnInput(e.target); // additive: fetch is on top of, not instead of, the above
 });
+
+// Keyboard nav for whichever input currently owns the suggestion list. A second, separate
+// listener (keydown vs. the input listener above) on the same delegated container — not a
+// second *input* listener, so it doesn't fight the "trigger from the existing handler" rule.
+$('waypoints').addEventListener('keydown', e => {
+  if (!e.target.classList.contains('wp') || suggestInput !== e.target || suggestBox.style.display === 'none') return;
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    setSuggestActive(suggestActive < suggestItems.length - 1 ? suggestActive + 1 : 0);
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    setSuggestActive(suggestActive > 0 ? suggestActive - 1 : suggestItems.length - 1);
+  } else if (e.key === 'Enter') {
+    if (suggestActive < 0) return; // nothing highlighted: behave exactly as today (bubbles to #panel's findRoutes)
+    e.preventDefault();
+    e.stopPropagation(); // stop #panel's Enter->findRoutes handler from also firing
+    pickSuggestion(suggestActive);
+  } else if (e.key === 'Escape' || e.key === 'Tab') {
+    hideSuggest(); // keeps whatever was typed — hideSuggest never touches input.value
+  }
+});
+
+// Scroll doesn't bubble, only capture, and #panel (the scrollable ancestor) is exactly where a
+// waypoint scrolls out from under its dropdown — capture on window catches that. Reposition-in-
+// place isn't worth the complexity the spec calls out; just hide, same as blur/Escape/resize.
+window.addEventListener('scroll', () => { if (suggestInput) hideSuggest(); }, true);
+window.addEventListener('resize', () => { if (suggestInput) hideSuggest(); });
+$('waypoints').addEventListener('focusout', e => { if (e.target.classList.contains('wp')) hideSuggest(); });
 $('waypoints').addEventListener('change', e => {
   if (!e.target.classList.contains('wp-refuel')) return;
   const i = +e.target.dataset.i;
@@ -3789,13 +4012,52 @@ if (new URLSearchParams(location.search).get('test')) {
     'the same centres at a different radius are a different search, not a cache hit');
 
   // geocode cache (geocodeCacheKey): normalized (trimmed, lowercased) query text hits on
-  // whitespace/case-only differences, a genuinely different query misses — the two behaviours
-  // Nominatim's "results must be cached" policy actually needs, without a jittery key silently
-  // never hitting the way the station-cache bug (above) once did.
+  // whitespace/case-only differences, a genuinely different query misses — without a jittery key
+  // silently never hitting the way the station-cache bug (above) once did.
   ok(geocodeCacheKey('  Denver, CO  ') === geocodeCacheKey('denver, co'),
     `whitespace/case differences on the same query hit the same cache key: ${geocodeCacheKey('  Denver, CO  ')}`);
   ok(geocodeCacheKey('Denver, CO') !== geocodeCacheKey('Chicago, IL'),
     'a genuinely different query misses the cache key');
+
+  // Waypoint geocoding (isPlace): the settlement-layer hit is accepted only when it really is a
+  // settlement. The "cheyene, WY" bug was a highway/residential hit — "Cheyene Avenue" in
+  // Wyandotte County, Kansas — sailing through as if it were the city of Cheyenne, Wyoming.
+  ok(isPlace({ properties: { osm_key: 'place', osm_value: 'city' } }), 'a city is accepted as a place');
+  ok(isPlace({ properties: { osm_key: 'boundary', osm_value: 'administrative' } }),
+    'an administrative boundary is accepted as a place');
+  ok(!isPlace({ properties: { osm_key: 'highway', osm_value: 'residential' } }),
+    'a street named like the town is rejected, so the search falls back instead of routing to it');
+  ok(!isPlace({ properties: { osm_key: 'landuse', osm_value: 'residential' } }),
+    'a landuse polygon is rejected — the layer filter alone still lets one through');
+  ok(!isPlace({}) && !isPlace(undefined), 'a malformed feature is rejected rather than throwing');
+
+  // photonLabel: Photon splits the address Nominatim returned as one display_name string, and
+  // callers still slice label.split(',')[0] for the waypoint's short name.
+  ok(photonLabel({ name: 'Cheyenne', county: 'Laramie County', state: 'Wyoming', country: 'United States' })
+    === 'Cheyenne, Laramie County, Wyoming, United States', 'photonLabel rebuilds a Nominatim-shaped label');
+  ok(photonLabel({ name: 'Denver', city: 'Denver', state: 'Colorado', country: 'United States' })
+    === 'Denver, Colorado, United States', 'a city whose name repeats in the city field is not doubled');
+  ok(photonLabel({ name: 'Gerlach', state: 'Nevada', country: 'United States' }).split(',')[0] === 'Gerlach',
+    'the short name callers display is the first comma-separated field');
+
+  // suggestionLabels (the waypoint autocomplete dropdown): pure over a Photon features array, so
+  // a malformed/empty response degrades to an empty list rather than throwing mid-keystroke.
+  const featCheyenne = { properties: { name: 'Cheyenne', county: 'Laramie County', state: 'Wyoming', country: 'United States' } };
+  const featDenver = { properties: { name: 'Denver', city: 'Denver', state: 'Colorado', country: 'United States' } };
+  const featChicago = { properties: { name: 'Chicago', city: 'Chicago', state: 'Illinois', country: 'United States' } };
+  ok(JSON.stringify(suggestionLabels([featCheyenne, featDenver, featChicago], 5)) ===
+    JSON.stringify(['Cheyenne, Laramie County, Wyoming, United States', 'Denver, Colorado, United States', 'Chicago, Illinois, United States']),
+    'suggestionLabels returns labels in order');
+  ok(suggestionLabels([featCheyenne, featDenver, featChicago], 2).length === 2, 'suggestionLabels caps at max');
+  ok(JSON.stringify(suggestionLabels([featDenver, featDenver, featDenver], 5)) === JSON.stringify(['Denver, Colorado, United States']),
+    'suggestionLabels de-duplicates identical labels');
+  ok(JSON.stringify(suggestionLabels([], 5)) === '[]', 'suggestionLabels tolerates an empty features array');
+  ok(JSON.stringify(suggestionLabels([null, {}, { properties: null }], 5)) === '[]',
+    'suggestionLabels tolerates malformed features without throwing');
+  ok(JSON.stringify(suggestionLabels(undefined, 5)) === '[]' && JSON.stringify(suggestionLabels('nope', 5)) === '[]',
+    'suggestionLabels tolerates a non-array input without throwing');
+  ok(JSON.stringify(suggestionLabels([{ properties: {} }, featDenver], 5)) === JSON.stringify(['Denver, Colorado, United States']),
+    'suggestionLabels drops a feature whose label comes out empty');
 
   // Discovery cache (discoveryCacheKey): rides on coordKey the same jitter-tolerant way
   // stationCacheKey does (a replanned route's OSRM-derived waypoints can land a few metres off
