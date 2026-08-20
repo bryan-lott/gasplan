@@ -76,86 +76,46 @@ Revisit the actual filter only if a per-station feed becomes available.
 
 ---
 
-## Max vehicle speed
+## `#over` doesn't move the ETA
 
-Let the user declare a top speed the vehicle can actually sustain. A Pinzgauer
-tops out around 65 mph, a Unimog rather less, and plenty of older trucks and
-loaded rigs won't hold an interstate limit up a grade. The planner currently
-assumes every vehicle drives whatever OSRM thinks the road flows at.
+Only the fuel-economy estimate feels `#over` ("MPH over the posted limit",
+default `5`, `index.html:820`) — the trip's reported ETA/duration does not. A
+driver who consistently runs 5+ over gets a fuel estimate that reflects it
+(`buildFuelAxis`'s `uncappedMph = calibMph + overLimitMph`, `index.html:1210`)
+but an ETA that's still OSRM's raw `route.duration`, unadjusted (see
+`etaHours`, `index.html:2616`). Those two numbers can quietly disagree.
 
 ### Why
 
-Two things go wrong for a slow vehicle today, and the second is the expensive
-one:
+Two knobs exist for "not going the speed OSRM assumed" — `#maxMph` (a
+vehicle's hard ceiling — shipped, see `applySpeedCap`/`speedCapRatio`) and
+`#over` (typically driving faster than the limit). Shipping the cap gave
+`route.duration` a real recompute path, built on the per-step speeds
+`stepSpeeds()` (`index.html:1122`) already exposes: a step's duration is
+stretched by exactly how much its implied speed exceeds the cap. `#over` was
+never wired into that path and still isn't, so it moves the gallons/dollars
+estimate but not the "arrive by" time shown anywhere in the app.
 
-1. **Fuel is estimated at a speed the vehicle can't reach.** `speedFactor()`
-   (`index.html:1088`) penalizes economy above a 60 mph baseline, so a vehicle
-   OSRM routes at 75 gets a penalty it would never actually incur.
-2. **The ETA is simply wrong, and nothing else notices.** Trip duration comes
-   straight from OSRM (`index.html:2541`, `route.duration`) and is never
-   recomputed from the speed the app itself assumed. On a long interstate leg a
-   55 mph vehicle can arrive hours after the quoted time — and because refuel
-   planning keys off arrival fuel and leg timing, a wrong ETA quietly degrades
-   the stop plan too, not just the number on screen.
+### What blocks it
 
-### What already exists
-
-More than you'd expect. There is already an additive speed offset:
-`#over` — "MPH over the posted limit", default `5` (`index.html:816`) — which
-reaches the economy model as:
-
-```javascript
-const actualMph = calibMph + overLimitMph;   // index.html:1147
-```
-
-So the ceiling itself is a clamp on a value that's already computed and already
-plumbed end to end. Roughly:
-
-```javascript
-const actualMph = Math.min(calibMph + overLimitMph, maxVehicleMph);
-```
-
-That plus a `maxMph` field on the vehicle object (`vehicleState()`,
-`index.html:3126`) and one input next to `#over` gets the *fuel* side correct.
-
-### The actual work
-
-Duration. `route.duration` is OSRM's, computed for a normal vehicle, and the
-app has no path today that recomputes time from its own adjusted speed. Doing
-this properly means deriving trip time from the per-step speeds the app already
-builds in `stepSpeeds()` (`index.html:1119`) after the clamp is applied, rather
-than trusting OSRM's total — and then feeding that back into ETA, leg times,
-and arrival-fuel.
-
-Worth noting this is a latent gap *already*: `#over` defaults to 5 mph and
-likewise doesn't move the ETA. A speed ceiling just makes the discrepancy large
-enough to be obviously wrong instead of quietly wrong.
-
-Two smaller wrinkles once the clamp exists:
-
-- `MOTORWAY_SPEED_BUMP = 1.15` (`index.html:972`) multiplies OSRM's speed on
-  motorways. A capped vehicle should be clamped *after* that bump, not before,
-  or the cap silently doesn't bind.
-- `speedFactor()`'s curve is the DOE passenger-car midpoint (7% per 5 mph over
-  60). It is not a claim about a Unimog, whose economy at its own top speed is
-  dominated by aerodynamics and gearing the curve knows nothing about. The cap
-  will make the estimate *less wrong*, not right. Don't oversell it, and leave
-  the manual MPG override (`#mpg`, `index.html:798`) as the real escape hatch —
-  a user who knows their rig's real number should always be able to just type it.
-
-### Smallest shippable slice
-
-Add `maxMph` to the vehicle state and clamp `actualMph` — accept that ETA stays
-OSRM's for now, and say so in the UI rather than pretending otherwise. Then do
-the duration recomputation as a follow-up, since it's a bigger change that also
-fixes the pre-existing `#over` gap.
+Not the plumbing — the recompute path already proves route/leg/step durations
+can be rebuilt from a per-step speed adjustment without breaking anything
+downstream (see the `applySpeedCap` checks in the `?test=1` suite). The catch
+is direction: `applySpeedCap` is provably safe *only* because every adjustment
+is a slowdown (a mechanical ceiling the vehicle cannot exceed), which is what
+makes it idempotent and guarantees a duration never decreases. `#over` pushes
+the other way — faster than OSRM's own routing assumption — and "how much
+faster does a real drive actually run vs. OSRM's free-flow estimate" isn't a
+bounded, physically-forced number the way a vehicle's top speed is. Wiring
+`#over` into the same mechanism needs that question answered first, not just
+the wiring.
 
 ### Where it would touch
 
-- `index.html:1147` — `actualMph`, where the clamp goes
-- `index.html:972` — `MOTORWAY_SPEED_BUMP`, clamp must come after it
-- `index.html:1119` — `stepSpeeds()`, the per-step data a real ETA would use
-- `index.html:2541` — `etaHours`, currently a straight scaling of OSRM duration
-- `index.html:3126` — `vehicleState()`, add the field so it round-trips in the
-  shared trip hash
-- `index.html:816` — `#over`, the input this one sits next to
+- `index.html:820` — `#over`, the input
+- `index.html:1210` — `buildFuelAxis`'s `uncappedMph`, where `#over` currently
+  only feeds the fuel-economy estimate
+- `index.html:2616` — `etaHours`, still a straight scaling of OSRM's
+  unadjusted `route.duration`
+- `index.html:1122` — `stepSpeeds()`, the per-step data an `#over`-aware ETA
+  would need — the same seam `applySpeedCap` already uses

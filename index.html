@@ -800,6 +800,9 @@ svg.leaflet-image-layer.leaflet-interactive path {
       <div id="tankNote" class="warn">Generic default, not from any vehicle API. Verify against your manual or fuel door.</div>
     </div>
   </div>
+  <div class="row">
+    <div><label for="maxMph">Max speed (mph)</label><input id="maxMph" type="number" min="1" placeholder="no limit"></div>
+  </div>
   <div id="rangeInfo" class="meta"></div>
   <label for="fuelType">Fuel type</label>
   <select id="fuelType">
@@ -1132,10 +1135,70 @@ function mphAt(steps, km) {
   return s.mph || null;
 }
 
+// How much a single OSRM step's duration must stretch so its implied speed never exceeds a
+// vehicle's real top speed. Only ever stretches (ratio >= 1), never compresses — a Pinzgauer that
+// can't hold 75mph still isn't allowed to arrive *faster* than OSRM said. No cap (falsy maxMph in
+// any form — 0/null/undefined/NaN/''), a cap OSRM's own implied speed already respects, or
+// pathological rawMph (<=0, non-finite) all return exactly 1 — no stretch, no NaN/Infinity ever
+// escapes. Idempotent by construction: after applySpeedCap stretches a step, its new implied speed
+// equals maxMph exactly, so a second pass finds maxMph < rawMph false and returns 1 again — see the
+// #test=1 idempotence check.
+function speedCapRatio(rawMph, maxMph) {
+  const cap = +maxMph || 0; // '' / null / undefined / NaN all coerce to a falsy 0 here
+  if (!(cap > 0)) return 1;
+  if (!(rawMph > 0) || !isFinite(rawMph)) return 1;
+  return cap < rawMph ? rawMph / cap : 1;
+}
+
+// Stretches route.legs[].steps[].duration (never distance) to respect a vehicle speed cap, then
+// rolls the change back up into leg.duration and route.duration. No cap -> the exact same route
+// object back (no-op, provably untouched — see fetchRoute, the one place this is called). Otherwise
+// a brand-new route/legs/steps tree; the input is never mutated, so replanning or re-reading an
+// already-capped route can't double-stretch it.
+//
+// Adds the DELTA onto the existing leg/route duration rather than recomputing it as sum(steps) —
+// OSRM's leg.duration legitimately exceeds sum(its steps) (turn/intersection penalties that aren't
+// attributable to any single step), and rewriting to the step sum silently threw that overhead
+// away, which could make a *capped* (slower) trip's reported duration come out faster than the
+// uncapped one. Every ratio is >= 1 so every delta is >= 0 — a duration can now never decrease,
+// structurally, not just by convention. See the #test=1 "leg-level overhead survives" checks.
+function applySpeedCap(route, maxMph) {
+  const cap = +maxMph || 0;
+  if (!(cap > 0)) return route;
+  let routeDelta = 0;
+  const legs = (route.legs || []).map(leg => {
+    let legDelta = 0, rawSum = 0;
+    const steps = (leg.steps || []).map(step => {
+      if (!step) return step; // a malformed null entry — not real OSRM output, but don't throw on it
+      const dur = step.duration > 0 ? step.duration : 0;
+      rawSum += dur;
+      const distKm = (step.distance || 0) / 1000;
+      const rawMph = dur > 0 ? (distKm / KM_PER_MI) / (dur / 3600) : 0;
+      const ratio = speedCapRatio(rawMph, cap);
+      if (ratio === 1) return step;
+      const scaled = dur * ratio;
+      legDelta += scaled - dur;
+      return { ...step, duration: scaled };
+    });
+    routeDelta += legDelta;
+    // A leg missing its own duration (degenerate/synthetic input) falls back to the sum of its
+    // own original step durations — still a real, finite base, not NaN.
+    const baseLeg = Number.isFinite(leg.duration) ? leg.duration : rawSum;
+    return { ...leg, steps, duration: baseLeg + legDelta };
+  });
+  // Same fallback idea at the route level: legs[].duration above already has each delta baked in,
+  // so subtracting routeDelta back out first (before adding it back on the next line) recovers the
+  // pre-stretch total without double-counting the stretch.
+  const baseRoute = Number.isFinite(route.duration)
+    ? route.duration
+    : legs.reduce((s, l) => s + l.duration, 0) - routeDelta;
+  return { ...route, legs, duration: baseRoute + routeDelta };
+}
+
 // Builds a fuel-adjusted distance axis parallel to `sampleKm`: adjCum[i] is the "fuel km" cost
 // of the real distance sampleKm[0..i]. When every factor is 1 (no data, or a flat, calm, at-limit
 // route) adjCum === sampleKm and downstream planning is identical to the unadjusted case.
-function buildFuelAxis(sampleKm, samplePts, elevations, winds, steps, overLimitMph) {
+function buildFuelAxis(sampleKm, samplePts, elevations, winds, steps, overLimitMph, maxMph) {
   const adjCum = [0];
   const segments = []; // one entry per sample interval — the "where on the route" breakdown
   let terrainCost = 0, windCost = 0, speedCost = 0, weighted = 0;
@@ -1144,7 +1207,11 @@ function buildFuelAxis(sampleKm, samplePts, elevations, winds, steps, overLimitM
     const rawMph = mphAt(steps, (sampleKm[i - 1] + sampleKm[i]) / 2);
     // ponytail: 65mph fallback only fires if OSRM returned no usable step data for this stretch.
     const calibMph = rawMph ? (rawMph > MOTORWAY_MPH_THRESHOLD ? rawMph * MOTORWAY_SPEED_BUMP : rawMph) : 65;
-    const actualMph = calibMph + overLimitMph;
+    const uncappedMph = calibMph + overLimitMph;
+    // Clamp AFTER the motorway bump and the #over add-on, not before — clamping calibMph alone
+    // would let +overLimitMph (or the bump) lift the speed straight back past the cap and the cap
+    // would silently not bind. maxMph falsy (no cap set) leaves uncappedMph untouched.
+    const actualMph = (maxMph > 0 && maxMph < uncappedMph) ? maxMph : uncappedMph;
     const speed = speedFactor(actualMph);
 
     let terrain = 1;
@@ -1586,18 +1653,23 @@ async function fetchRoute(coords, opts = {}) {
   if (opts.alternatives) params.set('alternatives', 'true');
   const j = await getJSON(`https://router.project-osrm.org/route/v1/driving/${coordStr}?${params}`);
   if (j.code !== 'Ok' || !j.routes.length) throw new Error('No driving route between those points');
-  return j.routes;
+  // The one place every OSRM route passes through, discovery or full-geometry alike (every other
+  // fetchRoute caller in this file routes through here) — so capping here, once, makes every
+  // downstream consumer of route/leg/step duration (ETA, leg boundaries, stepCumulative, render,
+  // KML export, ...) correct automatically, with no edits needed at any of those call sites.
+  // opts.maxMph absent/falsy -> applySpeedCap returns each route completely unchanged.
+  return j.routes.map(r => applySpeedCap(r, opts.maxMph));
 }
 
 // OSRM only returns alternatives for a plain 2-coordinate request (verified: a 3rd coordinate
 // makes it silently ignore alternatives=true and return exactly one route) — this is that path.
 // Falls back to a single plain route if the alternatives request itself fails.
-async function fetchAlternatives(a, b) {
+async function fetchAlternatives(a, b, maxMph) {
   try {
-    const routes = await fetchRoute([a, b], { overview: 'false', alternatives: true });
+    const routes = await fetchRoute([a, b], { overview: 'false', alternatives: true, maxMph });
     return routes.map(route => ({ route, coords: [a, b] }));
   } catch {
-    try { return [{ route: (await fetchRoute([a, b], { overview: 'false' }))[0], coords: [a, b] }]; }
+    try { return [{ route: (await fetchRoute([a, b], { overview: 'false', maxMph }))[0], coords: [a, b] }]; }
     catch { return []; }
   }
 }
@@ -1631,11 +1703,11 @@ function keepAndLabel(all) {
 // option the user actually picks (see planCandidate). Falls back to the anchor probe grid
 // (anchorProbeCandidates) only when that leaves fewer than 2 distinct corridors (needsAnchorProbe)
 // — see the comment above ABSURD_MULT for why and how that's gated.
-async function discoverCandidates(a, b) {
-  const raw = await fetchAlternatives(a, b);
+async function discoverCandidates(a, b, maxMph) {
+  const raw = await fetchAlternatives(a, b, maxMph);
   const cheap = keepAndLabel(raw);
   if (!needsAnchorProbe(cheap)) return cheap;
-  const anchored = await anchorProbeCandidates([a, b], 0);
+  const anchored = await anchorProbeCandidates([a, b], 0, maxMph);
   return keepAndLabel([...raw, ...anchored]);
 }
 
@@ -1688,7 +1760,7 @@ function needsAnchorProbe(kept) { return kept.length < 2; }
 // fallback of last resort, only called when needsAnchorProbe says so. Every candidate is checked
 // with selfOverlapPct/passesOverlapGate before being kept; a route that fails is dropped silently,
 // same as a request that errors outright.
-async function anchorProbeCandidates(pts, legIdx) {
+async function anchorProbeCandidates(pts, legIdx, maxMph) {
   const a = pts[legIdx], b = pts[legIdx + 1];
   const grid = ANCHOR_FRACTIONS.flatMap(f => ANCHOR_OFFSETS_KM.map(off => anchorPoint(a, b, f, off)));
   // Same concurrency cap as Overpass (OVERPASS_CONCURRENCY) and the same reason: a free, no-SLA
@@ -1696,7 +1768,7 @@ async function anchorProbeCandidates(pts, legIdx) {
   const results = await mapConcurrent(grid, OVERPASS_CONCURRENCY, async anchor => {
     const coords = insertAnchor(pts, legIdx, anchor);
     try {
-      const [route] = await fetchRoute(coords, { overview: 'false' });
+      const [route] = await fetchRoute(coords, { overview: 'false', maxMph });
       const geom = pointsFromSteps(route);
       // No scoreable geometry means no self-overlap check ran — fail closed, not open: a route
       // that can't be scored is exactly the case not to trust (see the Moab spur in the comment
@@ -1731,25 +1803,25 @@ async function anchorProbeCandidates(pts, legIdx) {
 // ponytail: doesn't also stitch per-leg alternatives=true results back in for every other leg —
 // that's a combinatorial blow-up for corridors the longest leg already covers. Add per-leg
 // stitching if a trip is ever found that needs a distinct option this can't reach.
-async function discoverCandidatesChain(pts) {
+async function discoverCandidatesChain(pts, maxMph) {
   const legIdx = longestLegIndex(pts);
   const [a, b] = [pts[legIdx], pts[legIdx + 1]];
   const [straight, legAlts] = await Promise.all([
-    fetchRoute(pts, { overview: 'false' }).then(routes => [{ route: routes[0], coords: pts }]).catch(() => []),
-    fetchAlternatives(a, b),
+    fetchRoute(pts, { overview: 'false', maxMph }).then(routes => [{ route: routes[0], coords: pts }]).catch(() => []),
+    fetchAlternatives(a, b, maxMph),
   ]);
   const extraCalls = legAlts.slice(1).map(alt => {
     const anchor = corridorMidpoint(routeSteps(alt.route));
     if (!anchor) return Promise.resolve([]);
     const coords = insertAnchor(pts, legIdx, { lat: anchor[0], lon: anchor[1] });
-    return fetchRoute(coords, { overview: 'false' })
+    return fetchRoute(coords, { overview: 'false', maxMph })
       .then(routes => [{ route: routes[0], coords }]).catch(() => []);
   });
   const extras = await Promise.all(extraCalls);
   const raw = [straight, ...extras].flat();
   const cheap = keepAndLabel(raw);
   if (!needsAnchorProbe(cheap)) return cheap;
-  const anchored = await anchorProbeCandidates(pts, legIdx);
+  const anchored = await anchorProbeCandidates(pts, legIdx, maxMph);
   return keepAndLabel([...raw, ...anchored]);
 }
 
@@ -1764,16 +1836,19 @@ async function discoverCandidatesChain(pts) {
 // a 3+-point key never collide, so one Map safely covers both. Reordering or inserting a waypoint
 // changes the key (order and length both matter to the join), so those correctly miss and
 // re-discover — only a genuinely unchanged, same-order waypoint list hits.
-function discoveryCacheKey(pts) { return pts.map(p => coordKey([p.lat, p.lon])).join(';'); }
+// maxMph rides along in the key — a route capped at 45mph and the same route uncapped are not
+// the same cached answer (their durations genuinely differ), so a cap edit must miss and re-derive
+// rather than silently reusing whatever the last cap value produced.
+function discoveryCacheKey(pts, maxMph) { return pts.map(p => coordKey([p.lat, p.lon])).join(';') + '|' + (+maxMph || 0); }
 const discoveryCache = new Map();
 // Two waypoints: OSRM's own alternatives=true, directly (see discoverCandidates). 3+ waypoints:
 // alternatives=true is silently ignored past 2 coordinates, so discoverCandidatesChain keeps
 // every user waypoint fixed & in order and hunts for real alternatives only within the longest
 // leg (see longestLegIndex), anchored on their own geometry (see corridorMidpoint).
-async function discoverCandidatesFor(pts) {
-  const cacheKey = discoveryCacheKey(pts);
+async function discoverCandidatesFor(pts, maxMph) {
+  const cacheKey = discoveryCacheKey(pts, maxMph);
   if (discoveryCache.has(cacheKey)) return discoveryCache.get(cacheKey);
-  const candidates = pts.length === 2 ? await discoverCandidates(pts[0], pts[1]) : await discoverCandidatesChain(pts);
+  const candidates = pts.length === 2 ? await discoverCandidates(pts[0], pts[1], maxMph) : await discoverCandidatesChain(pts, maxMph);
   discoveryCache.set(cacheKey, candidates);
   return candidates;
 }
@@ -2522,7 +2597,7 @@ function forcedStopMissHtml(fw, forceOverpass) {
 // Samples the route, fetches terrain/wind, and turns them into a fuel-adjusted distance axis.
 // Never throws: a failed Open-Meteo call degrades that one effect to "no adjustment" and gets
 // reported in `notes`, so a weather-API outage never blocks stop planning.
-async function planEconomy(pts, cum, route, overLimitMph, windBasis = 'live', windDate = null) {
+async function planEconomy(pts, cum, route, overLimitMph, maxMph, windBasis = 'live', windDate = null) {
   const totalKm = cum[cum.length - 1];
   const n = Math.min(ELEV_SAMPLES, pts.length);
   const sampleKm = Array.from({ length: n }, (_, i) => totalKm * i / (n - 1));
@@ -2552,7 +2627,7 @@ async function planEconomy(pts, cum, route, overLimitMph, windBasis = 'live', wi
   if (windResult.status === 'fulfilled') winds = windResult.value;
   else notes.push(`wind (${windResult.reason.message})`);
 
-  return { sampleKm, notes, windBasis, windDate, ...buildFuelAxis(sampleKm, samplePts, elevations, winds, steps, overLimitMph) };
+  return { sampleKm, notes, windBasis, windDate, ...buildFuelAxis(sampleKm, samplePts, elevations, winds, steps, overLimitMph, maxMph) };
 }
 
 // --- export: Google Maps directions + KML -----------------------------------
@@ -3114,7 +3189,9 @@ function resetSelect(sel, placeholder) { sel.innerHTML = `<option value="">${pla
 
 function vehicle() {
   const mpg = +$('mpg').value, gallons = +$('gal').value;
-  return { mpg, gallons, rangeMi: vehicleRange(mpg, gallons) };
+  // Empty #maxMph -> +'' is 0 -> falsy -> "no cap", never a numeric default (see speedCapRatio).
+  const maxMph = +$('maxMph').value || 0;
+  return { mpg, gallons, rangeMi: vehicleRange(mpg, gallons), maxMph };
 }
 function updateRange() {
   const r = vehicle().rangeMi;
@@ -3124,7 +3201,7 @@ function updateRange() {
 // "the vehicle" means to both localStorage and a share link.
 function vehicleState() {
   return { y: $('vy').value, mk: $('vmk').value, md: $('vmd').value, tr: $('vtr').value,
-    mpg: $('mpg').value, gal: $('gal').value, ed: galEdited, fuelType: $('fuelType').value };
+    mpg: $('mpg').value, gal: $('gal').value, mx: $('maxMph').value, ed: galEdited, fuelType: $('fuelType').value };
 }
 function saveVehicle() { localStorage.setItem(VKEY, JSON.stringify(vehicleState())); }
 $('fuelType').addEventListener('change', saveVehicle);
@@ -3171,6 +3248,9 @@ $('gal').addEventListener('input', () => {
   galEdited = true; $('tankNote').className = 'meta'; $('tankNote').textContent = '';
   updateRange(); saveVehicle(); invalidateRoutes();
 });
+// No updateRange() call here — max speed doesn't change tank range, only ETA/economy, both of
+// which invalidateRoutes() already covers by forcing a replan.
+$('maxMph').addEventListener('input', () => { saveVehicle(); invalidateRoutes(); });
 
 // Restore last pick from localStorage (or vOverride, a share-hash's v{} — see tripPayload):
 // mpg/gallons are instant, the dropdown chain is a best-effort re-fetch that quietly gives up if
@@ -3186,6 +3266,9 @@ async function restoreVehicle(vOverride) {
   }
   $('mpg').value = v.mpg || $('mpg').value;
   $('gal').value = v.gal || $('gal').value;
+  // Missing `mx` (older save/share link, predates this field) -> falls through to #maxMph's own
+  // current value, which is empty by default markup — reads as "no cap", not 0 or NaN.
+  $('maxMph').value = v.mx || $('maxMph').value;
   $('fuelType').value = v.fuelType || 'gasoline'; // missing (older save, predates this field) -> gasoline
   // Missing `ed` (older save, predates this field) means "not edited" — the default warn note
   // in the markup already says the right thing and needs no touching. A true `ed` means the
@@ -3288,6 +3371,7 @@ async function findRoutes() {
   try {
     const baseMpg = vehicle().mpg;
     const rangeKm = vehicle().rangeMi * KM_PER_MI;
+    const maxMph = vehicle().maxMph;
     const reserve = +$('reserve').value / 100;
     const startFuel = +$('fuel').value / 100;
     const overLimitMph = +$('over').value || 0;
@@ -3320,7 +3404,7 @@ async function findRoutes() {
     const forcedWps = forcedWaypoints(pts0, activeWps);
 
     say('Finding route options…');
-    const candidates = await discoverCandidatesFor(pts0);
+    const candidates = await discoverCandidatesFor(pts0, maxMph);
     if (!candidates.length) throw new Error('OSRM returned no usable route for these waypoints');
     // An invalidating edit landed while discoverCandidatesFor was in flight — routesGeneration
     // moved past myGen. These corridors were discovered for waypoints/inputs that no longer
@@ -3329,7 +3413,7 @@ async function findRoutes() {
     if (routesGeneration !== myGen) return;
 
     currentCandidates = candidates;
-    currentCtx = { baseMpg, rangeKm, reserve, startFuel, overLimitMph, windBasis, windDate, forcedWps, fuelType };
+    currentCtx = { baseMpg, rangeKm, reserve, startFuel, overLimitMph, maxMph, windBasis, windDate, forcedWps, fuelType };
     selectedCandidateIndex = pickBestCandidate(candidates);
     renderOptions(candidates, selectedCandidateIndex);
     $('planBtn').disabled = false;
@@ -3349,7 +3433,7 @@ async function findRoutes() {
       cmpBtn.style.display = '';
       cmpBtn.onclick = async () => {
         cmpBtn.disabled = true;
-        try { await compareCandidates(candidates, baseMpg, overLimitMph, windBasis, windDate); }
+        try { await compareCandidates(candidates, baseMpg, overLimitMph, maxMph, windBasis, windDate); }
         finally { cmpBtn.disabled = false; }
       };
     }
@@ -3403,7 +3487,7 @@ function renderOptions(candidates, selectedIndex) {
 // this whole pipeline through fetchStations/overpassFuel instead — same shape either way, so
 // everything downstream of the station lookup (project/filterFuelType/planStops/render) is
 // unaffected by which source ran.
-async function planCandidate(candidate, { baseMpg, rangeKm, reserve, startFuel, overLimitMph, windBasis, windDate, forcedWps, fuelType }, forceOverpass = false) {
+async function planCandidate(candidate, { baseMpg, rangeKm, reserve, startFuel, overLimitMph, maxMph, windBasis, windDate, forcedWps, fuelType }, forceOverpass = false) {
   const myGen = routesGeneration;
   // Generation covers invalidation (waypoint/vehicle/reserve/... edits); candidate-still-selected
   // covers a card click, which moves selectedCandidateIndex without invalidating anything (see
@@ -3427,7 +3511,7 @@ async function planCandidate(candidate, { baseMpg, rangeKm, reserve, startFuel, 
     // the same corridor back (index order isn't guaranteed, so match on distance) rather than the
     // single default route a plain request would give. A via-route (3+ coords) is unambiguous.
     const twoPoint = candidate.coords.length === 2;
-    const routes = await fetchRoute(candidate.coords, twoPoint ? { overview: 'full', alternatives: true } : { overview: 'full' });
+    const routes = await fetchRoute(candidate.coords, twoPoint ? { overview: 'full', alternatives: true, maxMph } : { overview: 'full', maxMph });
     if (!current()) return; // a different card is selected now, or an edit invalidated this run
     const route = twoPoint
       ? routes.reduce((best, r) => Math.abs(r.distance - candidate.route.distance) < Math.abs(best.distance - candidate.route.distance) ? r : best)
@@ -3446,7 +3530,7 @@ async function planCandidate(candidate, { baseMpg, rangeKm, reserve, startFuel, 
     if (current()) $('refreshBtn').style.display = '';
 
     say('Checking terrain and wind…');
-    const econ = await planEconomy(pts, cum, route, overLimitMph, windBasis, windDate);
+    const econ = await planEconomy(pts, cum, route, overLimitMph, maxMph, windBasis, windDate);
     if (!current()) return;
     renderEconomy(econ, baseMpg);
     const { sampleKm, adjCum } = econ;
@@ -3639,7 +3723,7 @@ function drawEconLine(segments) {
 // measured at up to 3 corridors x (elevation + WIND_HIST_YEARS-per-bucket historical wind)
 // requests, real volume against a keyless, rate-limited API. Cached (elevCache/histCache), so a
 // repeat click on the same corridors costs nothing new.
-async function compareCandidates(candidates, baseMpg, overLimitMph, windBasis, windDate) {
+async function compareCandidates(candidates, baseMpg, overLimitMph, maxMph, windBasis, windDate) {
   $('compare').innerHTML = '<div class="meta">Comparing corridors on terrain/wind/speed…</div>';
   // Sequential, not Promise.all: firing every corridor's elevation+wind calls at once triggered
   // genuine Open-Meteo 429s (verified in a real browser, 2026-08-05), silently losing the
@@ -3647,7 +3731,7 @@ async function compareCandidates(candidates, baseMpg, overLimitMph, windBasis, w
   const results = [];
   for (const c of candidates) {
     const pts = pointsFromSteps(c.route);
-    results.push(pts ? { label: c.label, econ: await planEconomy(pts, cumulate(pts), c.route, overLimitMph, windBasis, windDate) }
+    results.push(pts ? { label: c.label, econ: await planEconomy(pts, cumulate(pts), c.route, overLimitMph, maxMph, windBasis, windDate) }
                       : { label: c.label, econ: null });
   }
   renderComparison(results, baseMpg, windBasis, windDate);
@@ -3926,6 +4010,203 @@ if (new URLSearchParams(location.search).get('test')) {
   ok(speedFactor(60) === 1, 'no penalty at the baseline');
   ok(Math.abs(speedFactor(65) - 0.93) < 1e-9, `5 over = ${speedFactor(65)}`);
   ok(Math.abs(speedFactor(70) - 0.86) < 1e-9, `10 over = ${speedFactor(70)}`);
+
+  // Max vehicle speed cap: may only ever slow a trip down, never speed it up, and with no cap
+  // the output must be bit-for-bit identical to before this feature existed (see FUTURE.md's "Max
+  // vehicle speed" and the design constraint on speedCapRatio/applySpeedCap themselves).
+  {
+    // speedCapRatio: every falsy "no cap" form returns exactly 1.
+    [[0, '0'], [null, 'null'], [undefined, 'undefined'], [NaN, 'NaN'], ['', "''"]].forEach(([val, label]) => {
+      const r = speedCapRatio(70, val);
+      ok(r === 1, `speedCapRatio(70, ${label}) === 1 (no cap set), got ${r}`);
+    });
+    ok(speedCapRatio(60, 70) === 1, `speedCapRatio: cap above rawMph is a no-op, got ${speedCapRatio(60, 70)}`);
+    ok(speedCapRatio(60, 60) === 1, `speedCapRatio: cap equal to rawMph is a no-op, got ${speedCapRatio(60, 60)}`);
+    ok(speedCapRatio(80, 40) === 2, `speedCapRatio: cap below rawMph = rawMph/maxMph, got ${speedCapRatio(80, 40)}`);
+    ok(speedCapRatio(0, 40) === 1, `speedCapRatio: rawMph 0 -> 1 (no manufactured stretch), got ${speedCapRatio(0, 40)}`);
+    ok(speedCapRatio(-10, 40) === 1, `speedCapRatio: negative rawMph -> 1, got ${speedCapRatio(-10, 40)}`);
+    const infRatio = speedCapRatio(Infinity, 40);
+    ok(infRatio === 1 && isFinite(infRatio), `speedCapRatio: Infinity rawMph -> 1, not Infinity/NaN, got ${infRatio}`);
+
+    // applySpeedCap: synthetic OSRM-shaped fixture — mph chosen so distance = mph * KM_PER_MI *
+    // 1000 * (duration/3600) lands on a clean number, and mixes some steps over a future 50mph
+    // test cap and some under it.
+    const mphStep = (mph, durationS) => ({ distance: mph * KM_PER_MI * 1000 * durationS / 3600, duration: durationS });
+    const capSteps1 = [mphStep(40, 3600), mphStep(60, 3600), mphStep(80, 3600)]; // 40 under, 60/80 over a 50mph cap
+    const capSteps2 = [mphStep(30, 1800)]; // under a 50mph cap
+    const sumBy = (arr, f) => arr.reduce((s, x) => s + f(x), 0);
+    const capLeg1 = { steps: capSteps1, duration: sumBy(capSteps1, s => s.duration), distance: sumBy(capSteps1, s => s.distance) };
+    const capLeg2 = { steps: capSteps2, duration: sumBy(capSteps2, s => s.duration), distance: sumBy(capSteps2, s => s.distance) };
+    const capRoute = { distance: capLeg1.distance + capLeg2.distance, duration: capLeg1.duration + capLeg2.duration, legs: [capLeg1, capLeg2] };
+    const pristine = JSON.stringify(capRoute);
+
+    const durations = route => ({ route: route.duration, legs: (route.legs || []).map(l => l.duration),
+      steps: (route.legs || []).map(l => (l.steps || []).map(s => s.duration)) });
+    const distances = route => ({ route: route.distance, legs: (route.legs || []).map(l => l.distance),
+      steps: (route.legs || []).map(l => (l.steps || []).map(s => s.distance)) });
+
+    // No cap -> the exact same route object back, so the no-cap path is provably untouched.
+    ok(applySpeedCap(capRoute, 0) === capRoute, 'applySpeedCap: no cap (0) returns the identical route reference');
+    ok(applySpeedCap(capRoute, null) === capRoute, 'applySpeedCap: no cap (null) returns the identical route reference');
+    ok(applySpeedCap(capRoute, undefined) === capRoute, 'applySpeedCap: no cap (undefined) returns the identical route reference');
+    ok(JSON.stringify(durations(applySpeedCap(capRoute, 0))) === JSON.stringify(durations(capRoute)),
+      'applySpeedCap: no cap leaves every duration deep-equal to the pristine fixture');
+
+    // A cap above every step's speed (max step here is 80mph) must leave every duration exactly
+    // unchanged — the "doesn't make things worse" guarantee.
+    const noBind = applySpeedCap(capRoute, 100);
+    ok(JSON.stringify(durations(noBind)) === JSON.stringify(durations(capRoute)),
+      'applySpeedCap: a cap above every step\'s speed leaves every duration exactly unchanged');
+
+    // A binding 50mph cap: 40/30mph steps are untouched (kept by reference, not just by value —
+    // the "exact" in "keep their exact original duration"), the 60/80mph steps stretch.
+    const bound = applySpeedCap(capRoute, 50);
+    ok(bound.legs[0].steps[0] === capLeg1.steps[0], 'applySpeedCap: an under-cap step is returned by the same reference (untouched)');
+    ok(bound.legs[0].steps[0].duration === 3600, `applySpeedCap: under-cap 40mph step keeps its exact original duration, got ${bound.legs[0].steps[0].duration}`);
+    ok(bound.legs[1].steps[0].duration === 1800, `applySpeedCap: under-cap 30mph step keeps its exact original duration, got ${bound.legs[1].steps[0].duration}`);
+    ok(bound.legs[0].steps[1].duration > capLeg1.steps[1].duration, `applySpeedCap: over-cap 60mph step's duration increases, got ${bound.legs[0].steps[1].duration}`);
+    ok(bound.legs[0].steps[2].duration > capLeg1.steps[2].duration, `applySpeedCap: over-cap 80mph step's duration increases, got ${bound.legs[0].steps[2].duration}`);
+    ok(bound.duration > capRoute.duration, `applySpeedCap: a binding cap increases total route duration, got ${bound.duration} vs ${capRoute.duration}`);
+    ok(bound.legs.every((l, i) => l.steps.every((s, j) => s.duration >= capRoute.legs[i].steps[j].duration)),
+      'applySpeedCap: no individual step duration ever decreases');
+
+    // The stretched steps' own implied speed now equals the cap exactly (within float tolerance).
+    const impliedMph = s => (s.distance / 1000 / KM_PER_MI) / (s.duration / 3600);
+    ok(Math.abs(impliedMph(bound.legs[0].steps[1]) - 50) < 1e-9, `applySpeedCap: stretched 60mph step's implied speed = cap (50), got ${impliedMph(bound.legs[0].steps[1])}`);
+    ok(Math.abs(impliedMph(bound.legs[0].steps[2]) - 50) < 1e-9, `applySpeedCap: stretched 80mph step's implied speed = cap (50), got ${impliedMph(bound.legs[0].steps[2])}`);
+
+    // Idempotence: a second pass at the same cap is a no-op, since the first pass already brought
+    // every capped step's implied speed down to exactly the cap. Compared with float tolerance,
+    // not string equality — the second pass's rawMph recompute (distance/duration, then back
+    // through duration=distance/rawMph) round-trips through division twice, which can land a
+    // sub-ULP off cap even though the ratio is mathematically exactly 1.
+    const boundTwice = applySpeedCap(applySpeedCap(capRoute, 55), 55);
+    const boundOnce = applySpeedCap(capRoute, 55);
+    const durationsClose = (x, y) => Math.abs(x.route - y.route) < 1e-6 &&
+      x.legs.every((l, i) => Math.abs(l - y.legs[i]) < 1e-6) &&
+      x.steps.every((leg, i) => leg.every((s, j) => Math.abs(s - y.steps[i][j]) < 1e-6));
+    ok(durationsClose(durations(boundTwice), durations(boundOnce)),
+      `applySpeedCap: applying the same cap twice matches applying it once (idempotent), got ${JSON.stringify(durations(boundTwice))} vs ${JSON.stringify(durations(boundOnce))}`);
+
+    // Distances are never touched, anywhere, capped or not.
+    ok(JSON.stringify(distances(bound)) === JSON.stringify(distances(capRoute)),
+      'applySpeedCap: no distance changes anywhere, total or per-step');
+
+    // leg.duration / route.duration stay internally consistent after capping.
+    ok(bound.legs.every(l => Math.abs(l.duration - sumBy(l.steps, s => s.duration)) < 1e-6),
+      'applySpeedCap: each leg.duration equals the sum of its own (capped) steps');
+    ok(Math.abs(bound.duration - sumBy(bound.legs, l => l.duration)) < 1e-6,
+      'applySpeedCap: route.duration equals the sum of its (capped) legs');
+
+    // Never mutates the input, regardless of how many times it's been fed through the function.
+    ok(JSON.stringify(capRoute) === pristine, 'applySpeedCap: the input route fixture is never mutated by any of the calls above');
+
+    // Doesn't throw on a route with no legs, a leg with no steps, or a zero-duration step.
+    let threw = false;
+    try {
+      applySpeedCap({ distance: 100, duration: 10 }, 50);            // no legs at all
+      applySpeedCap({ legs: [{ distance: 10, duration: 10 }] }, 50); // leg with no steps
+      applySpeedCap({ legs: [{ steps: [{ distance: 1000, duration: 0 }] }] }, 50); // zero-duration step
+    } catch (e) { threw = e; }
+    ok(!threw, `applySpeedCap: no-legs / no-steps / zero-duration-step fixtures don't throw, got ${threw && threw.message}`);
+  }
+
+  // Regression: OSRM's leg.duration can legitimately exceed sum(its steps) — turn/intersection
+  // overhead not attributable to any single step. An earlier version of applySpeedCap rewrote
+  // leg.duration to the step sum, silently discarding that overhead — which could make a CAPPED
+  // (slower) trip report as FASTER than the uncapped one. The fix adds only the delta the stretch
+  // introduces, so real OSRM overhead survives untouched.
+  {
+    const mphStepOverhead = (mph, durationS) => ({ distance: mph * KM_PER_MI * 1000 * durationS / 3600, duration: durationS });
+    // Steps sum to 1000s (400 + 600); leg.duration is 1100s — 100s of leg-level overhead the
+    // steps themselves don't carry. Only the 60mph step exceeds a 50mph cap; the 30mph one doesn't.
+    const stepA = mphStepOverhead(30, 400);
+    const stepB = mphStepOverhead(60, 600);
+    const overheadLeg = { steps: [stepA, stepB], duration: 1100, distance: stepA.distance + stepB.distance };
+    const overheadRoute = { distance: overheadLeg.distance, duration: overheadLeg.duration, legs: [overheadLeg] };
+    const overheadPristine = JSON.stringify(overheadRoute);
+
+    const bound = applySpeedCap(overheadRoute, 50);
+    const addedStepTime = bound.legs[0].steps[1].duration - stepB.duration;
+    ok(Math.abs(bound.legs[0].duration - (1100 + addedStepTime)) < 1e-9,
+      `applySpeedCap: leg-level overhead (100s) survives a binding cap exactly — expected 1100 + added step time (${addedStepTime.toFixed(2)}), got ${bound.legs[0].duration}`);
+    ok(bound.legs[0].duration >= 1100,
+      `applySpeedCap: an overhead leg's duration never drops below its original 1100s, got ${bound.legs[0].duration}`);
+
+    // A cap above every step's speed (max step here is 60mph) -> nothing stretches -> leg.duration
+    // must be EXACTLY 1100, unchanged, overhead included — the defect's second reproduction.
+    const notBound = applySpeedCap(overheadRoute, 100);
+    ok(notBound.legs[0].duration === 1100,
+      `applySpeedCap: a non-binding cap leaves an overhead leg's duration exactly unchanged (1100), got ${notBound.legs[0].duration}`);
+
+    // route.duration after ANY cap >= route.duration before, across caps that bind on both steps,
+    // one step, or neither.
+    [20, 40, 50, 65, 100, 1000].forEach(cap => {
+      const capped = applySpeedCap(overheadRoute, cap);
+      ok(capped.duration >= overheadRoute.duration,
+        `applySpeedCap: route.duration never decreases under cap=${cap} (${capped.duration} >= ${overheadRoute.duration})`);
+      ok(capped.legs[0].steps.every((s, i) => s.duration >= overheadRoute.legs[0].steps[i].duration),
+        `applySpeedCap: no step duration decreases under cap=${cap}`);
+    });
+
+    // A null entry in steps (malformed, not real OSRM output, but guarded anyway) does not throw.
+    let nullThrew = false;
+    try { applySpeedCap({ legs: [{ steps: [stepA, null, stepB], duration: 1100 }] }, 50); }
+    catch (e) { nullThrew = e; }
+    ok(!nullThrew, `applySpeedCap: a null entry in steps does not throw, got ${nullThrew && nullThrew.message}`);
+
+    // A leg missing .duration entirely (and a route missing .duration entirely) still produces a
+    // finite, sensible value — falls back to the sum of original step durations, then adds the
+    // stretch delta on top, rather than NaN leaking through.
+    const noDurationRoute = { legs: [{ steps: [stepA, stepB] }] }; // no leg.duration, no route.duration
+    const noDurationResult = applySpeedCap(noDurationRoute, 50);
+    ok(Number.isFinite(noDurationResult.legs[0].duration) && noDurationResult.legs[0].duration >= 1000,
+      `applySpeedCap: a leg missing .duration falls back to a finite value >= its own step sum, got ${noDurationResult.legs[0].duration}`);
+    ok(Number.isFinite(noDurationResult.duration),
+      `applySpeedCap: route.duration is finite even when neither leg nor route carried an original duration, got ${noDurationResult.duration}`);
+
+    // Idempotence and non-mutation must still hold with leg-level overhead present, not just the
+    // no-overhead fixture above.
+    const overheadOnce = applySpeedCap(overheadRoute, 55);
+    const overheadTwice = applySpeedCap(applySpeedCap(overheadRoute, 55), 55);
+    ok(Math.abs(overheadOnce.duration - overheadTwice.duration) < 1e-6 &&
+       overheadOnce.legs[0].steps.every((s, i) => Math.abs(s.duration - overheadTwice.legs[0].steps[i].duration) < 1e-6),
+      `applySpeedCap: idempotence holds with leg-level overhead too, got ${overheadOnce.duration} vs ${overheadTwice.duration}`);
+    ok(JSON.stringify(overheadRoute) === overheadPristine,
+      'applySpeedCap: the overhead-fixture input is never mutated either');
+  }
+
+  // buildFuelAxis speed-cap clamp: clamps AFTER the motorway bump and #over add-on, not before —
+  // clamping calibMph alone would let either lift the speed straight back past the cap.
+  {
+    const capFuelSteps = [
+      { toKm: 50, mph: 40 },  // plain road, under MOTORWAY_MPH_THRESHOLD -> no bump
+      { toKm: 100, mph: 60 }, // motorway-class, over threshold -> MOTORWAY_SPEED_BUMP applies
+    ];
+    const capFuelKm = [0, 50, 100];
+    const capFuelPts = capFuelKm.map(() => [40, -100]); // unused: winds is null, bearing never runs
+    const over = 30;
+    const noCap = buildFuelAxis(capFuelKm, capFuelPts, null, null, capFuelSteps, over);
+    const capped = buildFuelAxis(capFuelKm, capFuelPts, null, null, capFuelSteps, over, 50);
+
+    ok(Math.abs(noCap.segments[0].speed - speedFactor(40 + over)) < 1e-9,
+      `sanity: uncapped plain-road segment factors calibMph+over (${40 + over}mph), got ${noCap.segments[0].speed}`);
+    ok(Math.abs(capped.segments[0].speed - speedFactor(50)) < 1e-9,
+      `buildFuelAxis: plain-road segment's speed factor reflects the 50mph clamp, not calibMph+over, got ${capped.segments[0].speed}`);
+
+    const motorwayUncapped = 60 * MOTORWAY_SPEED_BUMP + over;
+    ok(Math.abs(noCap.segments[1].speed - speedFactor(motorwayUncapped)) < 1e-9,
+      `sanity: uncapped motorway segment factors the bumped speed (${motorwayUncapped.toFixed(1)}mph), got ${noCap.segments[1].speed}`);
+    ok(Math.abs(capped.segments[1].speed - speedFactor(50)) < 1e-9,
+      `buildFuelAxis: clamp binds even on a motorway step (bump happens, then clamp) — got ${capped.segments[1].speed}`);
+
+    // No cap (omitted arg, explicit undefined, explicit 0) must all match exactly — adding the
+    // parameter must not perturb any existing caller that doesn't know about it.
+    const noCapUndef = buildFuelAxis(capFuelKm, capFuelPts, null, null, capFuelSteps, over, undefined);
+    const noCapZero = buildFuelAxis(capFuelKm, capFuelPts, null, null, capFuelSteps, over, 0);
+    ok(JSON.stringify(noCap) === JSON.stringify(noCapUndef) && JSON.stringify(noCap) === JSON.stringify(noCapZero),
+      'buildFuelAxis: no cap (omitted / undefined / 0) all produce identical output');
+  }
 
   // Fuel-adjusted axis: with every factor pinned to 1 (a 40mph step, under both the motorway
   // calibration threshold and the speed baseline; no elevation/wind data), the axis must exactly
